@@ -1,0 +1,34 @@
+#!/bin/sh
+# Runs as root after the macOS installer has written Walden's payload.
+#
+# The only thing this decides is whether the daemon should be running, and it
+# does not decide it: preinstall already found the answer on the machine. A
+# fresh installation is left inactive, because installing Walden is not asking
+# it to block anything. An upgrade that interrupted a running daemon puts it
+# back, on the new version, and the daemon resumes the block from its own
+# persisted state.
+
+set -e
+
+LABEL="org.scotto.waldend"
+TARGET="system/${LABEL}"
+JOB="/Library/LaunchDaemons/${LABEL}.plist"
+MARKER="${WALDEN_UPGRADE_MARKER:-/private/var/run/org.scotto.walden.upgrade}"
+
+if [ ! -e "$MARKER" ]; then
+  echo "Walden is installed and inactive. Run 'walden start' to begin a block."
+  exit 0
+fi
+
+rm -f "$MARKER"
+
+echo "Walden was running a block; restarting its daemon on the new version."
+
+# The job ships disabled so that installing Walden does not start it, and the
+# replaced property list says so again. launchd keeps its enable override
+# separately from the job, so the block's own enablement survived the upgrade,
+# but it is re-asserted here rather than assumed.
+launchctl enable "$TARGET"
+launchctl bootstrap system "$JOB"
+
+exit 0

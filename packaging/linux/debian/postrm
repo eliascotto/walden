@@ -1,0 +1,94 @@
+#!/bin/sh
+# Runs as root after dpkg has removed Walden's files.
+#
+# An ordinary removal keeps the daemon's persisted block state. That state is
+# the record of a block someone chose not to be able to cancel, so uninstalling
+# is not allowed to be the way around it: an unfinished block resumes if Walden
+# is installed again. `dpkg --purge` is the explicit request that deletes it,
+# and is the only thing here that does.
+#
+# WALDEN_STATE_DIR and WALDEN_UPGRADE_MARKER exist so the packaging tests can
+# run this script against temporary paths instead of the machine's own.
+
+set -e
+
+STATE_DIR="${WALDEN_STATE_DIR:-/etc}"
+MARKER="${WALDEN_UPGRADE_MARKER:-/run/walden-upgrade-restart}"
+UPDATED_CATALOG="${WALDEN_UPDATED_CATALOG_DIR:-/var/lib/walden/catalog}"
+
+# Keep in sync with packaging/common/persisted-state.sh. This script runs on
+# machines that do not have the checkout, so the functions are copied here.
+walden_sha256_string() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1
+  else
+    echo "walden: neither sha256sum nor shasum is available" >&2
+    return 1
+  fi
+}
+
+walden_machine_id() {
+  os=$(uname -s)
+  id=""
+
+  if [ "$os" = "Linux" ]; then
+    for path in /etc/machine-id /var/lib/dbus/machine-id; do
+      if [ -f "$path" ]; then
+        id=$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "$path")
+        [ -n "$id" ] && break
+      fi
+    done
+  elif [ "$os" = "Darwin" ]; then
+    if command -v ioreg >/dev/null 2>&1; then
+      id=$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null |
+        awk -F'"' '/IOPlatformSerialNumber/ && NF >= 4 { print $4; exit }')
+    fi
+    if [ -z "$id" ] && command -v sysctl >/dev/null 2>&1; then
+      id=$(sysctl -n kern.hostuuid 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    fi
+  fi
+
+  if [ -z "$id" ]; then
+    id="walden-unknown-machine"
+  fi
+  printf '%s\n' "$id"
+}
+
+# The daemon names this file after this machine. Only that file is a purge
+# target: a glob of hex-named dotfiles would also delete files Walden does not
+# own.
+remove_persisted_state() {
+  name=".$(walden_sha256_string "waldend-settings-$(walden_machine_id)")"
+  path="${STATE_DIR}/${name}"
+  [ -f "$path" ] || return 0
+
+  echo "Removing Walden's persisted block state at ${path}."
+  chattr -i "$path" 2>/dev/null || true
+  rm -f "$path"
+}
+
+case "$1" in
+  remove)
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl daemon-reload || true
+    fi
+
+    # The package-bundled snapshot goes with the package files. The cache
+    # `walden catalog update` wrote is not a package file, and leaving it
+    # would make a later install keep serving lists the new package did not
+    # ship.
+    rm -rf "$UPDATED_CATALOG"
+
+    echo "Walden's persisted block state was kept. An unfinished block resumes"
+    echo "if Walden is installed again; 'dpkg --purge walden' deletes it."
+    ;;
+  purge)
+    remove_persisted_state
+    rm -rf "$UPDATED_CATALOG"
+    rm -f "$MARKER"
+    ;;
+esac
+
+exit 0

@@ -1,0 +1,37 @@
+#!/bin/sh
+# Runs as root before the macOS installer writes Walden's payload.
+#
+# A macOS package cannot tell the installer it is an upgrade, so this makes no
+# distinction: it notes whether a daemon is running right now and stops it.
+# On a fresh install nothing is running, nothing is noted, and the installation
+# is left inactive. On an upgrade the note is what postinstall reads to put the
+# daemon back, on the version that just replaced it.
+#
+# Stopping the daemon does not touch the block. The hosts entries and firewall
+# rules stay exactly as they are while the payload is replaced, so the machine
+# is never briefly unblocked mid-upgrade; only the process maintaining them is
+# absent, for the seconds between this script and postinstall.
+
+set -e
+
+LABEL="org.scotto.waldend"
+TARGET="system/${LABEL}"
+MARKER="${WALDEN_UPGRADE_MARKER:-/private/var/run/org.scotto.walden.upgrade}"
+
+# A stale note would restart a daemon nobody asked to run, so the record starts
+# empty every time rather than being trusted from a previous installation.
+rm -f "$MARKER"
+
+if launchctl print "$TARGET" 2>/dev/null |
+  grep -Eq '^[[:space:]]*(state = running|pid = [0-9]+)'; then
+  mkdir -p "$(dirname "$MARKER")"
+  : >"$MARKER"
+  chmod 600 "$MARKER"
+fi
+
+# An unloaded job releases the executable the installer is about to replace.
+# Without this the old daemon keeps running until the machine restarts, which
+# is the one outcome an upgrade must not produce.
+launchctl bootout "$TARGET" 2>/dev/null || true
+
+exit 0

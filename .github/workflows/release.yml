@@ -1,0 +1,214 @@
+# Official releases are produced only from version tags. A branch push, a
+# pull request, or a tag that does not match Cargo.toml cannot publish.
+#
+# Signing and notarization are not part of this workflow. They can be added
+# as a job that consumes the unsigned packages and produces signed copies
+# without changing how packages are built or how the GitHub Release is
+# assembled.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify-tag:
+    name: Verify tag
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.verify.outputs.version }}
+      prerelease: ${{ steps.verify.outputs.prerelease }}
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require the tag to match Cargo.toml
+        id: verify
+        run: |
+          set -euo pipefail
+          ./scripts/verify-release-tag.sh "${GITHUB_REF_NAME}"
+          . ./scripts/package-common.sh
+          echo "version=${VERSION}" >>"$GITHUB_OUTPUT"
+          case "${VERSION}" in
+            *-*) echo "prerelease=true" >>"$GITHUB_OUTPUT" ;;
+            *) echo "prerelease=false" >>"$GITHUB_OUTPUT" ;;
+          esac
+
+  quality:
+    name: Quality
+    needs: verify-tag
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+    with:
+      artifact-retention-days: 30
+
+  source:
+    name: Source archive
+    needs: verify-tag
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Write the source archive
+        run: ./scripts/source-archive.sh
+
+      - name: Upload the source archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: source
+          path: dist/walden-${{ needs.verify-tag.outputs.version }}.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub Release
+    needs: [verify-tag, quality, source]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VERSION: ${{ needs.verify-tag.outputs.version }}
+      PRERELEASE: ${{ needs.verify-tag.outputs.prerelease }}
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Collect package and source artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Require every expected artifact
+        run: |
+          set -euo pipefail
+          missing=0
+          for artifact in \
+            "walden-${VERSION}-macos-arm64.pkg" \
+            "walden-${VERSION}-macos-x86_64.pkg" \
+            "walden_${VERSION}-1_amd64.deb" \
+            "walden_${VERSION}-1_arm64.deb" \
+            "walden-${VERSION}.tar.gz"
+          do
+            if [ ! -f "dist/${artifact}" ]; then
+              echo "missing dist/${artifact}" >&2
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Refusing to publish a partial release" >&2
+            ls -la dist >&2 || true
+            exit 1
+          fi
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          . ./scripts/package-common.sh
+          : >dist/SHA256SUMS
+          for artifact in \
+            "walden-${VERSION}-macos-arm64.pkg" \
+            "walden-${VERSION}-macos-x86_64.pkg" \
+            "walden_${VERSION}-1_amd64.deb" \
+            "walden_${VERSION}-1_arm64.deb" \
+            "walden-${VERSION}.tar.gz"
+          do
+            printf '%s  %s\n' "$(sha256_of "dist/${artifact}")" "${artifact}" >>dist/SHA256SUMS
+          done
+          cat dist/SHA256SUMS
+
+      - name: Generate release notes
+        run: |
+          set -euo pipefail
+          if [ "$PRERELEASE" = "true" ]; then
+            ./scripts/generate-release-notes.sh --prerelease >dist/RELEASE_NOTES.md
+          else
+            ./scripts/generate-release-notes.sh >dist/RELEASE_NOTES.md
+          fi
+
+      - name: Publish the GitHub Release
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          args=(--title "Walden ${VERSION}" --notes-file dist/RELEASE_NOTES.md)
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease --latest=false)
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Replacing the existing ${tag} release from a re-run"
+            gh release delete "$tag" --yes
+          fi
+          gh release create "$tag" "${args[@]}" \
+            "dist/walden-${VERSION}-macos-arm64.pkg" \
+            "dist/walden-${VERSION}-macos-x86_64.pkg" \
+            "dist/walden_${VERSION}-1_amd64.deb" \
+            "dist/walden_${VERSION}-1_arm64.deb" \
+            "dist/walden-${VERSION}.tar.gz" \
+            dist/SHA256SUMS
+
+  downstream:
+    name: Downstream recipes
+    needs: [verify-tag, publish]
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.verify-tag.outputs.version }}
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch published artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate the Arch recipe from the published source
+        run: |
+          set -euo pipefail
+          ./scripts/package-arch.sh --source-archive "dist/walden-${VERSION}.tar.gz"
+          echo "Arch recipe points at the GitHub Release source archive."
+          echo "Publish it to the AUR or a project repository separately."
+
+      - name: Print Homebrew cask fields
+        run: |
+          set -euo pipefail
+          . ./scripts/package-common.sh
+          pkg="walden-${VERSION}-macos-arm64.pkg"
+          echo "Homebrew tap updates are not opened automatically."
+          echo "url: ${HOMEPAGE}/releases/download/v${VERSION}/${pkg}"
+          echo "sha256: $(sha256_of "dist/${pkg}")"
+          echo "A second cask or on_arch variant is needed for x86_64:"
+          echo "url: ${HOMEPAGE}/releases/download/v${VERSION}/walden-${VERSION}-macos-x86_64.pkg"
+          echo "sha256: $(sha256_of "dist/walden-${VERSION}-macos-x86_64.pkg")"
+
+      - name: Upload the Arch recipe
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arch-recipe
+          path: dist/arch/
+          if-no-files-found: error
+          retention-days: 30

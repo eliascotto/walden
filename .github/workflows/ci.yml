@@ -1,0 +1,179 @@
+# Pull-request and main-branch verification. This workflow never publishes
+# packages: it has no write permission, does not run on version tags, and
+# does not create GitHub Releases.
+#
+# Unsupported combinations, recorded rather than skipped:
+# - Windows
+# - 32-bit architectures
+# - Linux without systemd and nftables
+# - macOS 11 and earlier
+# - Privileged installation, firewall, and hosts-file tests (those need a
+#   disposable VM; see docs/testing.md)
+#
+# macOS x86_64 packages are cross-built on Apple Silicon. Native Intel runners
+# are not used. Linux arm64 is built and tested on ubuntu-24.04-arm.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+    inputs:
+      artifact-retention-days:
+        description: How long to keep built packages for diagnosis.
+        type: number
+        required: false
+        default: 7
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: ubuntu-24.04
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+          - name: macos-arm64
+            runner: macos-15
+    steps:
+      - name: Check out the committed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Format, lint, test, and document
+        run: ./scripts/check.sh
+
+  linux-container:
+    name: Linux container
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the committed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run the unprivileged Linux container suite
+        run: ./scripts/test-linux.sh
+
+  package:
+    name: Package (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            artifact: walden-*-macos-arm64.pkg
+            build: ./scripts/package-macos.sh --arch arm64
+            inspect: ./scripts/inspect-package.sh dist/walden-*-macos-arm64.pkg --release-dir target/aarch64-apple-darwin/release
+          - name: macos-x86_64
+            runner: macos-15
+            target: x86_64-apple-darwin
+            artifact: walden-*-macos-x86_64.pkg
+            build: ./scripts/package-macos.sh --arch x86_64
+            inspect: ./scripts/inspect-package.sh dist/walden-*-macos-x86_64.pkg --release-dir target/x86_64-apple-darwin/release
+          - name: linux-amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: walden_*_amd64.deb
+            build: ./scripts/package-deb.sh --arch amd64
+            inspect: ./scripts/inspect-package.sh dist/walden_*_amd64.deb --release-dir target/x86_64-unknown-linux-gnu/release
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: walden_*_arm64.deb
+            build: ./scripts/package-deb.sh --arch arm64
+            inspect: ./scripts/inspect-package.sh dist/walden_*_arm64.deb --release-dir target/aarch64-unknown-linux-gnu/release
+    steps:
+      - name: Check out the committed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Debian packaging tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y dpkg-dev lintian
+
+      - name: Stamp packages with the commit date
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >>"$GITHUB_ENV"
+
+      - name: Build the package
+        run: ${{ matrix.build }}
+
+      - name: Inspect the package
+        run: ${{ matrix.inspect }}
+
+      - name: Upload the package for diagnosis
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: package-${{ matrix.name }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: ${{ inputs.artifact-retention-days || 7 }}
+
+  arch-recipe:
+    name: Arch recipe
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the committed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Generate the Arch recipe from this commit
+        run: |
+          set -euo pipefail
+          ./scripts/source-archive.sh --output /tmp/walden-ci-source.tar.gz
+          ./scripts/package-arch.sh --source-archive /tmp/walden-ci-source.tar.gz
+          test -f dist/arch/PKGBUILD
+          test -f dist/arch/walden.install
+          grep -q 'sha256sums=' dist/arch/PKGBUILD
+          grep -F '/usr/share/walden/catalog/v1' dist/arch/PKGBUILD
+
+  ci-success:
+    name: CI
+    if: always()
+    needs: [check, linux-container, package, arch-recipe]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Confirm every required job succeeded
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          needs = json.loads(os.environ["RESULTS"])
+          failed = [name for name, job in needs.items() if job.get("result") != "success"]
+          if failed:
+              print("required jobs that did not succeed:", ", ".join(failed))
+              sys.exit(1)
+          print("all required jobs succeeded")
+          PY

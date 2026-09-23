@@ -1,0 +1,5 @@
+walden (@VERSION@-@DEB_REVISION@) @DEB_DISTRIBUTION@; urgency=medium
+
+  * Walden @VERSION@. Release notes: @HOMEPAGE@/releases
+
+ -- @MAINTAINER@  @DEB_DATE@

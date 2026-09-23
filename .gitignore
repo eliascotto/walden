@@ -1,0 +1,7 @@
+/target
+/dist
+
+# The walden-list snapshot, fetched by scripts/fetch-catalog.sh. Category lists
+# are published by walden-list, not kept here; assets/catalog.lock is the only
+# record of them this repository carries.
+/vendor

@@ -1,0 +1,20 @@
+# The walden-list snapshot this checkout builds, tests, and packages against.
+#
+# Walden does not curate category lists. They are built and published by
+# walden-list, and this file is the one place that says which published
+# snapshot belongs to this source. Pinning a commit rather than a branch is
+# what makes two builds of one source install the same domains: `main` moves
+# whenever an upstream list does.
+#
+# The two checksums are the snapshot's identity. scripts/fetch-catalog.sh
+# refuses a download that does not match them, so a rewritten history or a
+# substituted file is a failed fetch rather than a quietly different package.
+#
+# To adopt a newer snapshot, run scripts/fetch-catalog.sh --update, review the
+# category counts it prints, and commit the rewritten file.
+
+repository = "https://github.com/eliascotto/walden-list"
+ref = "714cf497ac9c0dd97d7b298f3be1f9f7a2a87aa5"
+dist_path = "dist/v1"
+manifest_sha256 = "d7b35e3a7f45ea6a1423275797bc4aa3dea4faf35c0844b3dcd98c7655559d50"
+checksums_sha256 = "30c40c94a3dcc95ff1bb7af573033f3164851c024399c875f853b504a17e2e94"

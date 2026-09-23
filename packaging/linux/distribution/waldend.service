@@ -1,0 +1,25 @@
+# The systemd unit shipped by Walden's distribution packages, owned by the
+# Debian and Arch packages. Walden enables, starts, and disables this unit at
+# runtime, but never writes or deletes it.
+#
+# It differs from ../waldend.service in one line. A distribution package may
+# not install anything under /usr/local, which is reserved for the machine's
+# administrator, so the daemon goes under /usr and ExecStart follows it. The
+# runtime reads whichever location holds the executable, so both are valid.
+#
+# The package leaves the unit installed and disabled, so a fresh installation
+# stays idle until `walden start` enables it.
+#
+# Restart=on-failure: systemd restarts the daemon if it dies, but treats the
+# clean exit it makes after a completed block as final.
+
+[Unit]
+Description=Walden website-blocking daemon
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/walden/waldend
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

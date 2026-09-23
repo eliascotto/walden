@@ -1,0 +1,34 @@
+#!/bin/sh
+# Runs as root before dpkg unpacks Walden.
+#
+# Its whole job is to notice, while the old version is still installed, whether
+# a daemon is running. postinst cannot ask afterwards: by then dpkg has already
+# replaced the executable, and a daemon that was stopped by the upgrade looks
+# exactly like one that was never started. The note left here is the only
+# difference between an upgrade that resumes an active block and one that
+# quietly leaves the machine unenforced.
+#
+# WALDEN_UPGRADE_MARKER exists so the packaging tests can run this script
+# against a temporary path instead of the machine's own.
+
+set -e
+
+SERVICE="waldend.service"
+MARKER="${WALDEN_UPGRADE_MARKER:-/run/walden-upgrade-restart}"
+
+case "$1" in
+  upgrade)
+    # A note left over from an interrupted upgrade would restart a daemon
+    # nobody asked to run, so the record starts empty rather than being
+    # trusted from a previous attempt.
+    rm -f "$MARKER"
+
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SERVICE"; then
+      mkdir -p "$(dirname "$MARKER")"
+      : >"$MARKER"
+      chmod 600 "$MARKER"
+    fi
+    ;;
+esac
+
+exit 0

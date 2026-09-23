@@ -1,0 +1,36 @@
+name: Set up Rust
+description: Install the pinned toolchain and cache downloaded crates, not compiled artifacts.
+
+inputs:
+  targets:
+    description: Extra rustup targets to install, space-separated.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install the pinned toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        toolchain=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml | head -n 1)
+        rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy --no-self-update
+        rustup default "$toolchain"
+        if [ -n "${{ inputs.targets }}" ]; then
+          # shellcheck disable=SC2086
+          rustup target add ${{ inputs.targets }}
+        fi
+        rustc --version
+        cargo --version
+
+    - name: Cache downloaded crates
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: crates-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+        restore-keys: |
+          crates-${{ runner.os }}-${{ runner.arch }}-

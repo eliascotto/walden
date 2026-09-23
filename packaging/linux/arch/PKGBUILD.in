@@ -1,0 +1,74 @@
+# Maintainer: @MAINTAINER@
+#
+# Generated from packaging/linux/arch/PKGBUILD.in by scripts/package-arch.sh,
+# which fills in the version, the release tarball, and its checksum. Changes
+# belong in that template.
+#
+# The recipe builds from a published release tarball whose checksum is fixed
+# here, not from a branch, so that what the Arch User Repository builds is the
+# same source the other packages were built from and cannot change underneath
+# the recipe afterwards.
+
+pkgname=walden
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="@SUMMARY@"
+arch=('x86_64' 'aarch64')
+url="@HOMEPAGE@"
+license=('@ARCH_LICENSE@' 'MIT' 'CC-BY-SA-4.0')
+depends=('systemd' 'nftables' 'glibc' 'gcc-libs' 'curl')
+makedepends=('cargo' 'curl')
+install="${pkgname}.install"
+source=("${pkgname}-${pkgver}.tar.gz::@ARCH_SOURCE_URL@")
+sha256sums=('@ARCH_SHA256@')
+
+prepare() {
+  cd "${pkgname}-${pkgver}"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+  ./scripts/fetch-catalog.sh
+}
+
+build() {
+  cd "${pkgname}-${pkgver}"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "${pkgname}-${pkgver}"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  export WALDEN_CATALOG_DIR="${PWD}/vendor/walden-list/v1"
+  cargo test --frozen --release
+}
+
+package() {
+  cd "${pkgname}-${pkgver}"
+
+  # The unit says where the daemon runs, so the recipe reads the path out of it
+  # rather than keeping a second copy that could disagree with it.
+  local unit='packaging/linux/distribution/waldend.service'
+  local daemon
+  daemon="$(sed -n 's/^ExecStart=//p' "${unit}")"
+
+  install -Dm755 target/release/walden "${pkgdir}/usr/bin/walden"
+  install -Dm755 target/release/waldend "${pkgdir}${daemon}"
+  install -Dm644 "${unit}" "${pkgdir}/usr/lib/systemd/system/waldend.service"
+
+  local catalog_src=vendor/walden-list/v1
+  local catalog_dest="${pkgdir}/usr/share/walden/catalog/v1"
+  install -d -m755 "${catalog_dest}/categories"
+  install -m444 "${catalog_src}/manifest.json" "${catalog_src}/checksums.txt" \
+    "${catalog_dest}/"
+  install -m444 "${catalog_src}/categories/"*.txt "${catalog_dest}/categories/"
+  chmod 555 "${catalog_dest}/categories" "${catalog_dest}"
+
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 docs/service-ownership.md \
+    "${pkgdir}/usr/share/doc/${pkgname}/service-ownership.md"
+  install -Dm644 docs/packaging.md "${pkgdir}/usr/share/doc/${pkgname}/packaging.md"
+  install -Dm644 docs/usage.md "${pkgdir}/usr/share/doc/${pkgname}/usage.md"
+}

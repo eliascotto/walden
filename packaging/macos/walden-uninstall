@@ -1,0 +1,191 @@
+#!/bin/sh
+# Removes the Walden macOS package.
+#
+# A macOS package installs but does not uninstall, so removal is this script,
+# installed alongside the software it takes off again. It removes exactly what
+# the package owns -- the two executables, the launchd job, the documentation,
+# and finally itself -- and forgets the receipt, so a later installation starts
+# clean.
+#
+# The daemon's persisted block state is deliberately left behind, the way
+# `dpkg --remove` leaves it on Linux. Uninstalling Walden is not a way to end a
+# block early, and a block that outlives the software it was started with is
+# resumed when Walden is installed again. `--purge` deletes that state instead.
+#
+# Usage:
+#   sudo walden-uninstall [--purge] [--force]
+
+set -eu
+
+usage() {
+  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+IDENTIFIER="org.scotto.walden"
+LABEL="org.scotto.waldend"
+TARGET="system/${LABEL}"
+JOB="/Library/LaunchDaemons/${LABEL}.plist"
+CLI="/usr/local/bin/walden"
+UNINSTALLER="/usr/local/bin/walden-uninstall"
+DOCUMENTATION="/usr/local/share/doc/walden"
+BUNDLED_CATALOG="${WALDEN_BUNDLED_CATALOG_DIR:-/usr/local/share/walden/catalog}"
+UPDATED_CATALOG="${WALDEN_UPDATED_CATALOG_DIR:-/usr/local/var/walden/catalog}"
+STATE_DIR="${WALDEN_STATE_DIR:-/usr/local/etc}"
+
+purge=no
+force=no
+for option in "$@"; do
+  case "$option" in
+    --purge) purge=yes ;;
+    --force) force=yes ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "walden: unknown option: ${option}" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [ "$(id -u)" -ne 0 ]; then
+  exec sudo "$0" "$@"
+fi
+
+daemon_is_running() {
+  launchctl print "$TARGET" 2>/dev/null |
+    grep -Eq '^[[:space:]]*(state = running|pid = [0-9]+)'
+}
+
+# The job names the executable it runs, so the package's own definition decides
+# what to remove rather than a second copy of the path kept here.
+installed_daemon() {
+  if [ -f "$JOB" ]; then
+    /usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" "$JOB" 2>/dev/null || true
+  fi
+}
+
+# Keep in sync with packaging/common/persisted-state.sh. This uninstaller
+# runs on machines that do not have the checkout, so the functions are copied
+# here.
+walden_sha256_string() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1
+  else
+    echo "walden: neither sha256sum nor shasum is available" >&2
+    return 1
+  fi
+}
+
+walden_machine_id() {
+  os=$(uname -s)
+  id=""
+
+  if [ "$os" = "Linux" ]; then
+    for path in /etc/machine-id /var/lib/dbus/machine-id; do
+      if [ -f "$path" ]; then
+        id=$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "$path")
+        [ -n "$id" ] && break
+      fi
+    done
+  elif [ "$os" = "Darwin" ]; then
+    if command -v ioreg >/dev/null 2>&1; then
+      id=$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null |
+        awk -F'"' '/IOPlatformSerialNumber/ && NF >= 4 { print $4; exit }')
+    fi
+    if [ -z "$id" ] && command -v sysctl >/dev/null 2>&1; then
+      id=$(sysctl -n kern.hostuuid 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    fi
+  fi
+
+  if [ -z "$id" ]; then
+    id="walden-unknown-machine"
+  fi
+  printf '%s\n' "$id"
+}
+
+# The daemon names this file after this machine. Only that file is a purge
+# target: a glob of hex-named dotfiles would also delete files Walden does not
+# own.
+remove_persisted_state() {
+  name=".$(walden_sha256_string "waldend-settings-$(walden_machine_id)")"
+  path="${STATE_DIR}/${name}"
+  [ -f "$path" ] || return 0
+
+  echo "==> removing persisted block state at ${path}"
+  chflags nouchg "$path" 2>/dev/null || true
+  rm -f "$path"
+}
+
+# Stopping the daemon does not take a block down: the hosts entries and
+# firewall rules it installed stay on the machine, and once Walden is gone
+# nothing is left to remove them when the block expires.
+if daemon_is_running && [ "$force" = "no" ]; then
+  cat >&2 <<EOF
+walden: a block is active.
+
+Removing Walden stops its daemon but does not lift the block. The hosts
+entries and firewall rules stay in place, and nothing will remove them when
+the block ends. Reinstalling Walden lets the daemon finish the block from its
+persisted state.
+
+Wait for the block to end, or pass --force to remove Walden anyway.
+EOF
+  exit 1
+fi
+
+daemon=$(installed_daemon)
+
+echo "==> stopping the daemon service"
+launchctl bootout "$TARGET" 2>/dev/null || true
+launchctl disable "$TARGET" 2>/dev/null || true
+
+echo "==> removing the package-owned files"
+if [ -n "$daemon" ]; then
+  rm -f "$daemon"
+fi
+rm -f "$JOB" "$CLI"
+rm -rf "$DOCUMENTATION" "$BUNDLED_CATALOG" "$UPDATED_CATALOG"
+rmdir /usr/local/share/walden /usr/local/var/walden 2>/dev/null || true
+
+# The receipt is the installer's own record of what it wrote, and so the only
+# authority on whether removal missed anything. The uninstaller is exempt
+# because it is still running and removes itself last.
+leftovers=""
+if pkgutil --pkg-info "$IDENTIFIER" >/dev/null 2>&1; then
+  receipt=$(mktemp "${TMPDIR:-/tmp}/walden-receipt.XXXXXX")
+  pkgutil --only-files --files "$IDENTIFIER" >"$receipt" 2>/dev/null || true
+
+  while IFS= read -r relative; do
+    if [ "/${relative}" != "$UNINSTALLER" ] && [ -e "/${relative}" ]; then
+      leftovers="${leftovers}/${relative}
+"
+    fi
+  done <"$receipt"
+
+  rm -f "$receipt"
+  pkgutil --forget "$IDENTIFIER" >/dev/null
+fi
+
+if [ -n "$leftovers" ]; then
+  echo "walden: these package-owned files could not be removed:" >&2
+  printf '%s' "$leftovers" >&2
+  exit 1
+fi
+
+if [ "$purge" = "yes" ]; then
+  remove_persisted_state
+else
+  echo "==> the daemon's persisted block state was left in ${STATE_DIR}"
+  echo "    An unfinished block resumes from it if Walden is installed again."
+  echo "    Removing Walden with --purge deletes it instead."
+fi
+
+echo "==> removed"
+
+# Last, because everything above is read from this file as it runs.
+rm -f "$UNINSTALLER"

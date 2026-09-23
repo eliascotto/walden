@@ -1,0 +1,25 @@
+# The systemd unit for a Walden daemon installed under /usr/local, which is
+# where an administrator installing Walden on one machine puts it and where
+# scripts/dev-install.sh puts a checkout. Walden enables, starts, and disables
+# this unit at runtime, but never writes or deletes it.
+#
+# Distribution packages install the daemon under /usr instead and ship
+# distribution/waldend.service, which is this unit with a matching ExecStart.
+# The runtime reads whichever location holds the executable.
+#
+# The installation leaves the unit disabled, so a fresh one stays idle until
+# `walden start` enables it.
+#
+# Restart=on-failure: systemd restarts the daemon if it dies, but treats the
+# clean exit it makes after a completed block as final.
+
+[Unit]
+Description=Walden website-blocking daemon
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/waldend
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,5 @@
+# Keep the compiler in lockstep with containers/test-linux.Dockerfile.
+# CI installs this toolchain; it does not use whatever rustc the runner has.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

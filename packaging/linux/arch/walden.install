@@ -1,0 +1,70 @@
+# Pacman scriptlet for Walden, the Arch counterpart of the Debian maintainer
+# scripts in ../debian. Both do the same three things, because the behaviour is
+# Walden's rather than any one distribution's: leave a fresh installation
+# inactive, put back a daemon an upgrade interrupted, and refuse to let removal
+# quietly imply that a block was lifted.
+#
+# pacman reloads systemd itself through its own hooks, so nothing here does.
+#
+# WALDEN_UPGRADE_MARKER exists so the packaging tests can run these functions
+# against a temporary path instead of the machine's own.
+
+_service='waldend.service'
+_marker="${WALDEN_UPGRADE_MARKER:-/run/walden-upgrade-restart}"
+
+post_install() {
+  echo "Walden is installed and inactive. Run 'walden start' to begin a block."
+}
+
+# Noted while the old version is still running, because once pacman has
+# replaced the executable a daemon that was stopped by the upgrade is
+# indistinguishable from one that was never started.
+pre_upgrade() {
+  rm -f "$_marker"
+
+  if systemctl is-active --quiet "$_service"; then
+    mkdir -p "$(dirname "$_marker")"
+    : >"$_marker"
+    chmod 600 "$_marker"
+  fi
+}
+
+# The restart is allowed to fail the transaction: a machine left with a block's
+# rules in place and no daemon to expire them is worse than an upgrade that
+# stops and says so.
+post_upgrade() {
+  if [ -e "$_marker" ]; then
+    rm -f "$_marker"
+    echo "Walden was running a block; restarting its daemon on the new version."
+    systemctl restart "$_service"
+  fi
+}
+
+pre_remove() {
+  if systemctl is-active --quiet "$_service"; then
+    cat >&2 <<'EOF'
+Warning: a Walden block is active.
+
+Removing Walden stops its daemon but does not lift the block. The /etc/hosts
+entries and nftables rules stay in place, and nothing will remove them when the
+block ends. Reinstalling Walden lets the daemon finish the block from its
+persisted state.
+EOF
+  fi
+
+  systemctl disable --now "$_service" >/dev/null 2>&1 || true
+}
+
+# The daemon's persisted block state is a record of a block someone chose not
+# to be able to cancel, so removing the software is not the way around it.
+# pacman has no purge, and deleting it is deliberately a separate, manual act.
+post_remove() {
+  rm -rf /var/lib/walden/catalog
+
+  cat <<'EOF'
+Walden's persisted block state was kept, as a root-owned dotfile under /etc
+whose name is a hex digest. An unfinished block resumes if Walden is installed
+again. Deleting that file, after clearing its immutable flag with chattr -i, is
+what discards the block instead.
+EOF
+}

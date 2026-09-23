@@ -1,0 +1,34 @@
+#!/bin/sh
+# Runs as root before dpkg removes Walden.
+#
+# Removal stops the daemon and takes away systemd's orders to start it again.
+# It does not lift a block, and the warning below is here because that is the
+# one thing a user removing Walden mid-block is likely to assume it does.
+#
+# An upgrade is not a removal and is left alone: postinst restarts the daemon
+# it interrupted.
+
+set -e
+
+SERVICE="waldend.service"
+
+case "$1" in
+  remove)
+    if command -v systemctl >/dev/null 2>&1; then
+      if systemctl is-active --quiet "$SERVICE"; then
+        cat >&2 <<'EOF'
+Warning: a Walden block is active.
+
+Removing Walden stops its daemon but does not lift the block. The /etc/hosts
+entries and nftables rules stay in place, and nothing will remove them when the
+block ends. Reinstalling Walden lets the daemon finish the block from its
+persisted state.
+EOF
+      fi
+
+      systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+exit 0

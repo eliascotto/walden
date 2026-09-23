@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The product definition wrapped around Walden's component package. It exists
+  for three reasons: to refuse installation on a machine of the wrong
+  architecture or an unsupported macOS, to give the installer somewhere to say
+  what a root daemon is doing on the machine, and to keep the package a
+  distribution product, which is the shape `productsign` and notarization
+  expect if Walden is ever signed.
+
+  There is nothing to choose: Walden is one component, installed whole into the
+  system domain, which is the only domain /usr/local and /Library are in.
+-->
+<installer-gui-script minSpecVersion="2">
+    <title>Walden @VERSION@</title>
+    <organization>org.scotto</organization>
+    <options customize="never" require-scripts="true" hostArchitectures="@HOST_ARCHITECTURES@"/>
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="@MINIMUM_MACOS@"/>
+        </allowed-os-versions>
+    </volume-check>
+    <readme file="README.txt" mime-type="text/plain"/>
+    <choices-outline>
+        <line choice="default">
+            <line choice="@IDENTIFIER@"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="@IDENTIFIER@" visible="false">
+        <pkg-ref id="@IDENTIFIER@"/>
+    </choice>
+    <pkg-ref id="@IDENTIFIER@" version="@VERSION@" onConclusion="none">@COMPONENT_PACKAGE@</pkg-ref>
+</installer-gui-script>

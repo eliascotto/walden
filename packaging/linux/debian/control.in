@@ -1,0 +1,18 @@
+Package: walden
+Version: @VERSION@-@DEB_REVISION@
+Architecture: @DEB_ARCHITECTURE@
+Maintainer: @MAINTAINER@
+Installed-Size: @DEB_INSTALLED_SIZE@
+Section: utils
+Priority: optional
+Homepage: @HOMEPAGE@
+Depends: systemd, nftables, libc6, curl
+Description: @DEB_SYNOPSIS@
+ Walden blocks the websites named in a small user-owned configuration file for
+ a period fixed when the block starts. The wait cannot be shortened or
+ cancelled, and the block outlives logging out, restarting the machine, and
+ removing this package.
+ .
+ A privileged daemon enforces the block through /etc/hosts and nftables. The
+ package installs that daemon inactive and leaves its systemd unit disabled:
+ it runs only while a block does.

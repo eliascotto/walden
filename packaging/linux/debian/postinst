@@ -1,0 +1,39 @@
+#!/bin/sh
+# Runs as root after dpkg has unpacked Walden.
+#
+# A fresh installation is left inactive and disabled. Installing Walden is not
+# asking it to block anything, and a package that started a root daemon would
+# put a machine under Walden's care before its owner said so.
+#
+# An upgrade puts back only what it interrupted. preinst wrote a note if a
+# daemon was running; where that note exists the daemon is restarted, comes up
+# on the new version, and resumes the block from its own persisted state. The
+# restart is deliberately allowed to fail the installation: a machine left with
+# a block's rules in place and no daemon to expire them is worse than an
+# upgrade that stops and says so.
+#
+# WALDEN_UPGRADE_MARKER exists so the packaging tests can run this script
+# against a temporary path instead of the machine's own.
+
+set -e
+
+SERVICE="waldend.service"
+MARKER="${WALDEN_UPGRADE_MARKER:-/run/walden-upgrade-restart}"
+
+case "$1" in
+  configure)
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl daemon-reload || true
+    fi
+
+    if [ -e "$MARKER" ]; then
+      rm -f "$MARKER"
+      echo "Walden was running a block; restarting its daemon on the new version."
+      systemctl restart "$SERVICE"
+    elif [ -z "${2:-}" ]; then
+      echo "Walden is installed and inactive. Run 'walden start' to begin a block."
+    fi
+    ;;
+esac
+
+exit 0
