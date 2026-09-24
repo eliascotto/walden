@@ -15,6 +15,11 @@ homepage = "https://github.com/eliascotto/walden"
 readme = "README.md"
 rust-version = "1.96"
 
+[profile.release]
+# Debian's lintian requires installed ELF executables to be stripped. Keep
+# stripping in the release build so packaged binaries match Cargo's output.
+strip = "symbols"
+
 [lib]
 name = "walden"
 path = "src/lib.rs"

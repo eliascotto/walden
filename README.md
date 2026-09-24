@@ -12,14 +12,28 @@ The book *Walden* by [Henry David Thoreau](https://en.wikipedia.org/wiki/Henry_D
 
 ## Quick start
 
-Install a package from [Releases](https://github.com/eliascotto/walden/releases), then:
+[Install the package for your system](#installation). Then choose what to block and start:
 
 ```console
-walden setup    # pick categories and an unlock delay; rerun anytime
-walden start    # start the block; delay locks in once rules are applied
-walden status   # show daemon and block state
-walden stop     # request end; sites stay blocked until the delay expires
+walden setup
+walden start
 ```
+
+`setup` asks which categories to block and how long to wait before unlocking.
+
+Check progress. If rules are still applying, run this again until it shows `Block: active`:
+
+```console
+walden status
+```
+
+When you’re ready to end the block:
+
+```console
+walden stop
+```
+
+Sites remain blocked for the unlock delay you chose during setup. Once the block is active, that delay cannot be shortened or cancelled.
 
 ### Available commands
 
