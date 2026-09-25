@@ -5,7 +5,7 @@ categories = [
     "network-programming",
 ]
 name = "walden"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 default-run = "walden"
 description = "Blocks distracting websites with an unblock-delay."

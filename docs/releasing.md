@@ -128,6 +128,10 @@ deletes the GitHub Release for that tag if one already exists, then creates
 it again with the full artifact set. It does not delete the git tag. Partial
 uploads from an interrupted run cannot remain next to a newer set of files.
 
+A re-run uses the same tagged commit. If the failure requires a source fix,
+commit the fix, update the package version, and create a new version tag after
+CI passes; re-running the old tag cannot pick up the fix.
+
 A packaging or test failure still stops publication: the publish job does not
 run until every build job has succeeded and every expected artifact is
 present.

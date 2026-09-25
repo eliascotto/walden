@@ -6,8 +6,14 @@
 # read from there rather than repeated in each recipe, where the copies would
 # quietly disagree after the first release.
 
-# Where the checkout is, from the path of the script that sourced this one.
+# Executable package scripts live in scripts/, so $0 locates their checkout.
+# When a workflow sources this file directly, $0 is the runner's temporary
+# shell script instead; GitHub Actions starts those steps in the checkout.
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if [ ! -f "${repo_root}/Cargo.toml" ] &&
+   [ -f "./Cargo.toml" ] && [ -f "./scripts/package-common.sh" ]; then
+  repo_root=$(pwd)
+fi
 
 # A package built twice from one source should come out the same both times, so
 # every timestamp a builder writes comes from here. Release automation sets it
