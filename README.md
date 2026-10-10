@@ -1,6 +1,6 @@
 # Walden
 
-A CLI tool designed to hard block websites that are known to be harmful or addictive. Created to help users be more productive and prevent brainrot.
+A CLI tool designed to hard block websites that are known to be harmful or addictive. Created to help users be more productive and prevent brain rot.
 
 The book *Walden* by [Henry David Thoreau](https://en.wikipedia.org/wiki/Henry_David_Thoreau) is the first use of the term ["brain-rot"](https://en.wikipedia.org/wiki/Brain_rot).
 
