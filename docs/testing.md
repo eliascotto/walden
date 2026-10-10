@@ -55,6 +55,10 @@ They also cover resume without an address cache, the first apply with failed
 lookups, failed persistence after installation, and firewall installation
 failures that must not replace the cache.
 
+Stop-persistence failures leave the current apply generation and progress intact.
+Tests pause a worker during resolution and verify that it still completes after
+a rejected stop, and that retrying a stop after persistence recovers cancels once.
+
 The CLI integration suite also exercises catalog selection with an absent,
 empty/incomplete, and invalid update cache. It verifies silent fallback for
 absence, one concise repair notice for recoverable cache damage, no raw

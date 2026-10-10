@@ -122,7 +122,8 @@ frames are rejected; the limit accommodates the entire bundled catalog.
 A missing or incomplete installation stops this at step 2. Nothing on the
 machine has changed at that point, and no block has been accepted. The unlock
 delay is locked in only once rules have been applied; `walden stop` during
-`applying` cancels the start.
+`applying` cancels the start once the stop request is durably saved. If saving
+fails, the stop is rejected and the current apply continues.
 
 ## Retiring the daemon
 

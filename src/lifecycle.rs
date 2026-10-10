@@ -544,9 +544,6 @@ impl Lifecycle {
 
         let apply_cancelled = !rules_applied;
         let block_end_at = if apply_cancelled {
-            state.apply_generation = state.apply_generation.wrapping_add(1);
-            state.apply_progress = None;
-            eprintln!("walden: apply cancelled before the block was locked in");
             Utc::now()
         } else {
             match unlock_delay_secs {
@@ -570,7 +567,8 @@ impl Lifecycle {
             }
         };
 
-        // Persist before returning so a restart can still complete the same teardown.
+        // Persist before cancelling the apply so a rejected stop leaves it running.
+        // A restart can still complete the same teardown after a successful save.
         let mut updated = state
             .valid_settings()
             .cloned()
@@ -580,6 +578,11 @@ impl Lifecycle {
             .persist_replacement(updated)
             .context("failed to durably save the stop request")?;
 
+        if apply_cancelled {
+            state.apply_generation = state.apply_generation.wrapping_add(1);
+            state.apply_progress = None;
+            eprintln!("walden: apply cancelled before the block was locked in");
+        }
         eprintln!("walden: the block will end at {block_end_at}");
         if apply_cancelled {
             Ok(protocol::StopOutcome::ApplyCancelled)
@@ -1454,6 +1457,117 @@ mod tests {
         assert!(format!("{err:#}").contains("failed to durably save the stop request"));
         assert!(format!("{err:#}").contains("injected persistence failure"));
         assert_eq!(lifecycle.status().block_end_at, None);
+    }
+
+    #[test]
+    fn failed_stop_during_apply_keeps_generation_and_progress_until_retry() {
+        let lifecycle = lifecycle_with_dependencies(
+            PersistedSettings::Valid(Settings::applying(
+                "operation-1".to_string(),
+                vec!["127.0.0.1".to_string()],
+                60,
+            )),
+            save_fails,
+            apply_ok,
+        );
+        {
+            let mut state = lifecycle.state();
+            state.apply_generation = 7;
+            state.apply_progress = Some(protocol::ApplyProgress {
+                stage: protocol::ApplyStage::Resolving,
+                completed: 0,
+                total: 1,
+                resolved_addresses: 0,
+                failed_lookups: 0,
+            });
+        }
+        let before = lifecycle.status();
+
+        let err = lifecycle.stop().unwrap_err();
+
+        assert!(format!("{err:#}").contains("failed to durably save the stop request"));
+        assert_eq!(lifecycle.status(), before);
+        assert_eq!(lifecycle.state().apply_generation, 7);
+
+        lifecycle.state().save_settings = save_ok;
+        assert_eq!(
+            lifecycle.stop().unwrap(),
+            protocol::StopOutcome::ApplyCancelled
+        );
+        let after = lifecycle.status();
+        assert_eq!(after.block_phase, protocol::BlockPhase::Ending);
+        assert_eq!(after.apply_progress, None);
+        assert_eq!(lifecycle.state().apply_generation, 8);
+        let block_end_at = after.block_end_at.expect("stop should set an end time");
+        assert_eq!(
+            lifecycle.stop().unwrap(),
+            protocol::StopOutcome::AlreadyEnding { block_end_at }
+        );
+        assert_eq!(lifecycle.state().apply_generation, 8);
+    }
+
+    #[test]
+    fn failed_stop_during_resolution_allows_the_current_apply_to_finish() {
+        use std::sync::mpsc::{self, Receiver, Sender};
+
+        static RESOLVER_GATE: Mutex<Option<(Sender<()>, Receiver<()>)>> = Mutex::new(None);
+
+        fn reject_stop(settings: &Settings) -> anyhow::Result<()> {
+            if settings.block_end_at.is_some() {
+                save_fails(settings)
+            } else {
+                save_ok(settings)
+            }
+        }
+
+        fn paused_resolution(
+            hosts: &[String],
+            progress: &mut dyn FnMut(resolver::ResolveProgress) -> bool,
+        ) -> BTreeSet<ResolvedAddr> {
+            if !progress(resolver::ResolveProgress {
+                completed: 0,
+                total: hosts.len(),
+                resolved_addresses: 0,
+                failed_lookups: 0,
+            }) {
+                return BTreeSet::new();
+            }
+            let (ready, resume) = RESOLVER_GATE.lock().unwrap().take().unwrap();
+            ready.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            resolve_all(hosts, progress)
+        }
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        *RESOLVER_GATE.lock().unwrap() = Some((ready_tx, resume_rx));
+        let mut lifecycle =
+            lifecycle_with_dependencies(PersistedSettings::Missing, reject_stop, apply_ok);
+        lifecycle.resolve_all = paused_resolution;
+        lifecycle
+            .start("operation-1".to_string(), vec!["127.0.0.1".to_string()], 60)
+            .unwrap();
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let before = lifecycle.status();
+        let generation = lifecycle.state().apply_generation;
+
+        let result = lifecycle.stop();
+        let after = lifecycle.status();
+        let generation_after = lifecycle.state().apply_generation;
+        // Release the worker before asserting so failures cannot leave it blocked.
+        resume_tx.send(()).unwrap();
+        wait_for_apply(&lifecycle);
+
+        let err = result.unwrap_err();
+        assert!(format!("{err:#}").contains("failed to durably save the stop request"));
+        assert_eq!(lifecycle.status().block_phase, protocol::BlockPhase::Active);
+        assert_eq!(lifecycle.status().block_end_at, None);
+        assert_eq!(
+            lifecycle.state().resolved,
+            Some(dns_addresses(&["127.0.0.1"]))
+        );
+        assert_eq!(after, before);
+        assert_eq!(generation_after, generation);
     }
 
     #[test]
