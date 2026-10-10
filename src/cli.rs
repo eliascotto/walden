@@ -164,9 +164,7 @@ fn start(
 ) -> anyhow::Result<()> {
     let (path, config) = user_config::load(config_override)?;
     let catalog = load_catalog(catalog_snapshot)?;
-    let effective = config.resolve(&catalog)?;
-    let delay = unlock_delay.unwrap_or(&config.unlock_delay);
-    let unlock_delay_secs = user_config::parse_unlock_delay_secs(delay)?;
+    let (effective, unlock_delay_secs) = prepare_start(&config, &catalog, unlock_delay)?;
 
     let website_count = effective.block_list.len();
     if website_count >= LARGE_BLOCK_NOTICE && !is_root() {
@@ -186,6 +184,19 @@ fn start(
     start_block(effective.block_list, unlock_delay_secs)?;
     println!("{}", applying_rules_message(website_count));
     Ok(())
+}
+
+// Keep configuration validation separate from service inspection and elevation.
+// Tests can verify the actual block inputs without starting an installed daemon.
+fn prepare_start(
+    config: &user_config::UserConfig,
+    catalog: &catalog::Catalog,
+    unlock_delay: Option<&str>,
+) -> anyhow::Result<(user_config::EffectiveConfig, u64)> {
+    let effective = config.resolve(catalog)?;
+    let delay = unlock_delay.unwrap_or(&config.unlock_delay);
+    let unlock_delay_secs = user_config::parse_unlock_delay_secs(delay)?;
+    Ok((effective, unlock_delay_secs))
 }
 
 fn applying_rules_message(website_count: usize) -> String {
@@ -900,6 +911,40 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
     use std::thread;
+
+    #[test]
+    fn start_uses_unlock_delay_from_the_configuration() {
+        let config = user_config::UserConfig::parse(
+            "schema_version = 1\nunlock_delay = \"5 seconds\"\ncategories = []\nwebsites = [\"example.com\"]\n",
+        )
+        .unwrap();
+        let args = Args::try_parse_from(["walden", "start"]).unwrap();
+        let CommandSet::Start { unlock_delay } = args.command else {
+            panic!("expected a start command");
+        };
+
+        let (effective, delay_secs) =
+            prepare_start(&config, &catalog::vendored(), unlock_delay.as_deref()).unwrap();
+        assert_eq!(delay_secs, 5);
+        assert_eq!(effective.block_list, ["example.com"]);
+    }
+
+    #[test]
+    fn start_can_override_the_configured_unlock_delay() {
+        let config = user_config::UserConfig::parse(
+            "schema_version = 1\nunlock_delay = \"5 seconds\"\ncategories = []\nwebsites = [\"example.com\"]\n",
+        )
+        .unwrap();
+        let args =
+            Args::try_parse_from(["walden", "start", "--unlock-delay", "2 minutes"]).unwrap();
+        let CommandSet::Start { unlock_delay } = args.command else {
+            panic!("expected a start command");
+        };
+
+        let (_, delay_secs) =
+            prepare_start(&config, &catalog::vendored(), unlock_delay.as_deref()).unwrap();
+        assert_eq!(delay_secs, 120);
+    }
 
     #[test]
     fn privileged_start_pins_the_already_verified_catalog() {

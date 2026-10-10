@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod support;
+use support::CommandTimeout;
+
 fn walden_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_walden"));
     command.env(
@@ -27,7 +30,7 @@ fn walden_with_installed_catalog(cache: &Path) -> Command {
 fn walden(args: &[&str]) -> Output {
     walden_command()
         .args(args)
-        .output()
+        .output_with_timeout()
         .expect("failed to run walden")
 }
 
@@ -191,7 +194,7 @@ fn an_empty_download_cache_uses_the_bundle_with_one_repair_notice() {
 
     let output = walden_with_installed_catalog(&cache)
         .arg("categories")
-        .output()
+        .output_with_timeout()
         .expect("failed to run walden categories");
     assert!(
         output.status.success(),
@@ -216,7 +219,7 @@ fn an_absent_download_cache_uses_the_bundle_silently() {
 
     let output = walden_with_installed_catalog(&cache)
         .arg("categories")
-        .output()
+        .output_with_timeout()
         .expect("failed to run walden categories");
     assert!(
         output.status.success(),
@@ -238,7 +241,7 @@ fn an_invalid_download_cache_uses_the_bundle_without_raw_parser_errors() {
 
     let output = walden_with_installed_catalog(&cache)
         .arg("categories")
-        .output()
+        .output_with_timeout()
         .expect("failed to run walden categories");
     assert!(
         output.status.success(),
@@ -292,29 +295,6 @@ fn start_validates_the_configuration_and_delay_before_elevation() {
     ]);
     assert!(!invalid_override.status.success());
     assert!(String::from_utf8_lossy(&invalid_override.stderr).contains("invalid unlock delay"));
-
-    fs::remove_dir_all(path.parent().unwrap()).unwrap();
-}
-
-#[test]
-fn start_uses_unlock_delay_from_the_configuration() {
-    let path = temp_config_path("start-from-config");
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(
-        &path,
-        "schema_version = 1\nunlock_delay = \"5 seconds\"\ncategories = []\nwebsites = [\"example.com\"]\n",
-    )
-    .unwrap();
-    let path_arg = path.to_string_lossy();
-
-    let output = walden(&["--config", &path_arg, "start"]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success());
-    assert!(
-        !stderr.contains("--unlock-delay"),
-        "start should not require --unlock-delay when the configuration has one: {stderr}"
-    );
-    assert!(!stderr.contains("invalid unlock delay"), "{stderr}");
 
     fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
@@ -379,7 +359,7 @@ fn catalog_update_installs_a_verified_snapshot_from_a_local_source() {
             "--from",
             &file_url(&walden::catalog::vendored_dir()),
         ])
-        .output()
+        .output_with_timeout()
         .expect("failed to run walden catalog update");
 
     assert!(
@@ -402,7 +382,7 @@ fn catalog_update_installs_a_verified_snapshot_from_a_local_source() {
         .env_remove(walden::catalog::CATALOG_DIR_ENV)
         .env(walden::catalog::CATALOG_CACHE_DIR_ENV, &cache)
         .args(["categories"])
-        .output()
+        .output_with_timeout()
         .expect("failed to run walden categories");
     assert!(
         listed.status.success(),
@@ -432,7 +412,7 @@ fn catalog_update_leaves_the_cache_alone_when_verification_fails() {
             "--from",
             &file_url(&walden::catalog::vendored_dir()),
         ])
-        .output()
+        .output_with_timeout()
         .expect("failed to seed the catalog cache");
     assert!(
         installed.status.success(),
@@ -449,7 +429,7 @@ fn catalog_update_leaves_the_cache_alone_when_verification_fails() {
         .env_remove(walden::catalog::CATALOG_DIR_ENV)
         .env(walden::catalog::CATALOG_CACHE_DIR_ENV, &cache)
         .args(["catalog", "update", "--from", &file_url(&tampered)])
-        .output()
+        .output_with_timeout()
         .expect("failed to run walden catalog update");
     assert!(!failed.status.success());
     assert_eq!(

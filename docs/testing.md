@@ -70,6 +70,13 @@ absence, one concise repair notice for recoverable cache damage, no raw
 manifest/parser errors, and continued use of the fully verified bundled
 snapshot.
 
+Every CLI subprocess in that suite has a ten-second execution limit. On timeout,
+the test kills the subprocess and its process group and includes captured stdout
+and stderr in the failure. Unlock-delay selection is tested in the CLI unit
+tests before service inspection or elevation, so a valid configuration cannot
+start an installed daemon or wait for a sudo password during that regression
+test.
+
 Package inspection fails if a required file is missing, an unexpected file is
 present, a packaged binary is not the release build, ownership is not root, or
 a fresh installation would start the service.
