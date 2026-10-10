@@ -49,6 +49,12 @@ Atomic-write tests force a rename failure, repair the destination, and retry
 in the same process. They also check temporary-file cleanup, stale files,
 concurrent writes, and private-file permissions in temporary directories.
 
+Lifecycle tests inject complete and partial DNS failures to check that existing
+firewall coverage survives and resolution retries before the normal cache TTL.
+They also cover resume without an address cache, the first apply with failed
+lookups, failed persistence after installation, and firewall installation
+failures that must not replace the cache.
+
 The CLI integration suite also exercises catalog selection with an absent,
 empty/incomplete, and invalid update cache. It verifies silent fallback for
 absence, one concise repair notice for recoverable cache damage, no raw

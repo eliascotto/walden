@@ -37,7 +37,7 @@ enum PersistedSettings {
 
 struct State {
     settings: PersistedSettings,
-    resolved: BTreeSet<ResolvedAddr>,
+    resolved: Option<BTreeSet<ResolvedAddr>>,
     resolved_at: Option<Instant>,
     save_settings: fn(&Settings) -> anyhow::Result<()>,
     apply_generation: u64,
@@ -156,7 +156,7 @@ impl Lifecycle {
         Lifecycle {
             state: Arc::new(Mutex::new(State {
                 settings,
-                resolved: BTreeSet::new(),
+                resolved: None,
                 resolved_at: None,
                 save_settings: settings::save_secure_settings_file,
                 apply_generation: 0,
@@ -270,11 +270,30 @@ impl Lifecycle {
             return;
         }
 
-        {
+        let resolved = {
             let mut state = self.state();
-            state.resolved = resolved.clone();
-            state.resolved_at = Some(Instant::now());
-        }
+            if state.apply_generation != generation {
+                return;
+            }
+            if failed_lookups > 0 && (already_applied || state.resolved.is_some()) {
+                // Keep working coverage while adding any new DNS answers.
+                // Leave the cache stale so the next integrity check retries DNS.
+                state.resolved_at = None;
+                eprintln!(
+                    "walden: DNS refresh failed for {failed_lookups} hostnames; keeping previous firewall coverage and retrying at the next integrity check"
+                );
+                let Some(mut retained) = state.resolved.clone() else {
+                    // Without cached addresses, leave installed rules untouched
+                    // until DNS can provide a complete replacement.
+                    state.apply_progress = None;
+                    return;
+                };
+                retained.extend(resolved);
+                retained
+            } else {
+                resolved
+            }
+        };
 
         if !self.set_apply_progress(
             generation,
@@ -295,6 +314,17 @@ impl Lifecycle {
         }
         if self.generation_cancelled(generation) {
             return;
+        }
+
+        {
+            let mut state = self.state();
+            if state.apply_generation != generation {
+                return;
+            }
+            // Only cache addresses that were successfully installed. A first
+            // apply may use partial DNS results, but must retry them promptly.
+            state.resolved = Some(resolved);
+            state.resolved_at = (failed_lookups == 0).then(Instant::now);
         }
 
         self.mark_rules_applied(generation);
@@ -474,6 +504,8 @@ impl Lifecycle {
         // The unlock delay is not locked in until rules_applied becomes true.
         (state.save_settings)(&settings)?;
         state.settings = PersistedSettings::Valid(settings);
+        state.resolved = None;
+        state.resolved_at = None;
         state.apply_progress = Some(initial_progress);
         drop(state);
 
@@ -621,7 +653,7 @@ impl Lifecycle {
         let cache_fresh = state
             .resolved_at
             .is_some_and(|resolved_at| resolved_at.elapsed() < RESOLUTION_TTL);
-        let resolved = cache_fresh.then(|| state.resolved.clone());
+        let resolved = cache_fresh.then(|| state.resolved.clone()).flatten();
         drop(state);
 
         if !rules_applied {
@@ -817,7 +849,7 @@ mod tests {
         Lifecycle {
             state: Arc::new(Mutex::new(State {
                 settings,
-                resolved: BTreeSet::new(),
+                resolved: None,
                 resolved_at: None,
                 save_settings,
                 apply_generation: 0,
@@ -873,6 +905,311 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn dns_addresses(addresses: &[&str]) -> BTreeSet<ResolvedAddr> {
+        addresses
+            .iter()
+            .map(|address| ResolvedAddr::Host(address.parse().unwrap()))
+            .collect()
+    }
+
+    fn dns_result(
+        hosts: &[String],
+        progress: &mut dyn FnMut(resolver::ResolveProgress) -> bool,
+        addresses: &[&str],
+        failed_lookups: usize,
+    ) -> BTreeSet<ResolvedAddr> {
+        let resolved = dns_addresses(addresses);
+        if progress(resolver::ResolveProgress {
+            completed: hosts.len(),
+            total: hosts.len(),
+            resolved_addresses: resolved.len(),
+            failed_lookups,
+        }) {
+            resolved
+        } else {
+            BTreeSet::new()
+        }
+    }
+
+    fn resolve_old_addresses(
+        hosts: &[String],
+        progress: &mut dyn FnMut(resolver::ResolveProgress) -> bool,
+    ) -> BTreeSet<ResolvedAddr> {
+        dns_result(hosts, progress, &["203.0.113.1", "2001:db8::1"], 0)
+    }
+
+    fn resolve_new_addresses(
+        hosts: &[String],
+        progress: &mut dyn FnMut(resolver::ResolveProgress) -> bool,
+    ) -> BTreeSet<ResolvedAddr> {
+        dns_result(hosts, progress, &["203.0.113.2", "2001:db8::2"], 0)
+    }
+
+    fn resolve_partial_addresses(
+        hosts: &[String],
+        progress: &mut dyn FnMut(resolver::ResolveProgress) -> bool,
+    ) -> BTreeSet<ResolvedAddr> {
+        dns_result(hosts, progress, &["203.0.113.2"], 1)
+    }
+
+    fn resolve_no_addresses(
+        hosts: &[String],
+        progress: &mut dyn FnMut(resolver::ResolveProgress) -> bool,
+    ) -> BTreeSet<ResolvedAddr> {
+        dns_result(hosts, progress, &[], hosts.len())
+    }
+
+    fn dns_refresh_settings() -> Settings {
+        let mut settings = running_settings();
+        settings.blocklist = Some(vec!["one.test".to_string(), "two.test".to_string()]);
+        settings
+    }
+
+    #[test]
+    fn failed_dns_refresh_keeps_working_addresses_and_retries_before_the_normal_ttl() {
+        static INSTALLED: Mutex<Vec<BTreeSet<ResolvedAddr>>> = Mutex::new(Vec::new());
+
+        fn install(_: &[String], addresses: &BTreeSet<ResolvedAddr>) -> anyhow::Result<()> {
+            INSTALLED.lock().unwrap().push(addresses.clone());
+            Ok(())
+        }
+
+        for (resolve, retained) in [
+            (
+                resolve_no_addresses as ResolveAll,
+                dns_addresses(&["203.0.113.1", "2001:db8::1"]),
+            ),
+            (
+                resolve_partial_addresses,
+                dns_addresses(&["203.0.113.1", "2001:db8::1", "203.0.113.2"]),
+            ),
+        ] {
+            INSTALLED.lock().unwrap().clear();
+            let mut lifecycle = lifecycle_with_dependencies(
+                PersistedSettings::Valid(dns_refresh_settings()),
+                save_ok,
+                install,
+            );
+            lifecycle.resolve_all = resolve_old_addresses;
+            lifecycle.run_apply();
+            let previous = dns_addresses(&["203.0.113.1", "2001:db8::1"]);
+            let expired = Instant::now() - RESOLUTION_TTL;
+            lifecycle.state().resolved_at = Some(expired);
+
+            lifecycle.resolve_all = resolve;
+            lifecycle.run_apply();
+
+            assert!(previous.is_subset(lifecycle.state().resolved.as_ref().unwrap()));
+            assert_eq!(lifecycle.state().resolved.as_ref(), Some(&retained));
+            assert_eq!(INSTALLED.lock().unwrap().last(), Some(&retained));
+            assert_eq!(lifecycle.state().resolved_at, None);
+            assert_eq!(lifecycle.status().block_phase, protocol::BlockPhase::Active);
+            assert_eq!(lifecycle.status().unlock_delay_secs, Some(60));
+            assert_eq!(lifecycle.status().apply_progress, None);
+
+            // An integrity check must retry now, rather than wait 15 minutes.
+            // The expired cache also avoids querying the real firewall.
+            lifecycle.resolve_all = resolve_new_addresses;
+            lifecycle.check_integrity();
+            wait_for_apply(&lifecycle);
+
+            let replacement = dns_addresses(&["203.0.113.2", "2001:db8::2"]);
+            assert_eq!(lifecycle.state().resolved.as_ref(), Some(&replacement));
+            assert_eq!(INSTALLED.lock().unwrap().last(), Some(&replacement));
+            assert!(lifecycle.state().resolved_at.unwrap().elapsed() < RESOLUTION_TTL);
+            assert_eq!(lifecycle.status().apply_progress, None);
+        }
+    }
+
+    #[test]
+    fn failed_dns_during_resume_keeps_firewall_rules_without_an_in_memory_cache() {
+        static INSTALLS: AtomicUsize = AtomicUsize::new(0);
+
+        fn install(_: &[String], _: &BTreeSet<ResolvedAddr>) -> anyhow::Result<()> {
+            INSTALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        for resolve in [
+            resolve_no_addresses as ResolveAll,
+            resolve_partial_addresses,
+        ] {
+            INSTALLS.store(0, Ordering::SeqCst);
+            let mut lifecycle = lifecycle_with_dependencies(
+                PersistedSettings::Valid(dns_refresh_settings()),
+                save_ok,
+                install,
+            );
+            lifecycle.resolve_all = resolve;
+            lifecycle.resume();
+            wait_for_apply(&lifecycle);
+
+            assert_eq!(INSTALLS.load(Ordering::SeqCst), 0);
+            assert_eq!(lifecycle.state().resolved, None);
+            assert_eq!(lifecycle.state().resolved_at, None);
+            assert_eq!(lifecycle.status().block_phase, protocol::BlockPhase::Active);
+            assert_eq!(lifecycle.status().apply_progress, None);
+
+            lifecycle.resolve_all = resolve_new_addresses;
+            lifecycle.check_integrity();
+            wait_for_apply(&lifecycle);
+            assert_eq!(INSTALLS.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                lifecycle.state().resolved,
+                Some(dns_addresses(&["203.0.113.2", "2001:db8::2"]))
+            );
+            assert!(lifecycle.state().resolved_at.is_some());
+        }
+    }
+
+    #[test]
+    fn initial_dns_failures_still_install_hosts_and_available_addresses_then_retry() {
+        static HOST_WRITES: AtomicUsize = AtomicUsize::new(0);
+        static INSTALLED: Mutex<Vec<BTreeSet<ResolvedAddr>>> = Mutex::new(Vec::new());
+
+        fn hosts(_: &[String]) -> anyhow::Result<()> {
+            HOST_WRITES.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn install(_: &[String], addresses: &BTreeSet<ResolvedAddr>) -> anyhow::Result<()> {
+            INSTALLED.lock().unwrap().push(addresses.clone());
+            Ok(())
+        }
+
+        for (resolve, expected) in [
+            (resolve_no_addresses as ResolveAll, BTreeSet::new()),
+            (resolve_partial_addresses, dns_addresses(&["203.0.113.2"])),
+        ] {
+            HOST_WRITES.store(0, Ordering::SeqCst);
+            INSTALLED.lock().unwrap().clear();
+            let mut lifecycle =
+                lifecycle_with_dependencies(PersistedSettings::Missing, save_ok, install);
+            lifecycle.apply_hosts = hosts;
+            lifecycle.resolve_all = resolve;
+            // A new block must not reuse addresses from a previous block.
+            lifecycle.state().resolved = Some(dns_addresses(&["203.0.113.1", "2001:db8::1"]));
+            lifecycle.state().resolved_at = Some(Instant::now());
+            lifecycle
+                .start(
+                    "initial-dns-failure".to_string(),
+                    vec!["one.test".to_string(), "two.test".to_string()],
+                    60,
+                )
+                .unwrap();
+            wait_for_apply(&lifecycle);
+
+            assert_eq!(HOST_WRITES.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                INSTALLED.lock().unwrap().as_slice(),
+                std::slice::from_ref(&expected)
+            );
+            assert_eq!(lifecycle.state().resolved.as_ref(), Some(&expected));
+            assert_eq!(lifecycle.state().resolved_at, None);
+            assert_eq!(lifecycle.status().block_phase, protocol::BlockPhase::Active);
+
+            // Even a hosts-only first apply must gain firewall coverage as
+            // individual lookups recover, without waiting for every hostname.
+            lifecycle.resolve_all = resolve_partial_addresses;
+            lifecycle.check_integrity();
+            wait_for_apply(&lifecycle);
+            assert_eq!(
+                INSTALLED.lock().unwrap().last(),
+                Some(&dns_addresses(&["203.0.113.2"]))
+            );
+            assert_eq!(lifecycle.state().resolved_at, None);
+
+            lifecycle.resolve_all = resolve_new_addresses;
+            lifecycle.check_integrity();
+            wait_for_apply(&lifecycle);
+            assert_eq!(HOST_WRITES.load(Ordering::SeqCst), 3);
+            assert_eq!(
+                INSTALLED.lock().unwrap().last(),
+                Some(&dns_addresses(&["203.0.113.2", "2001:db8::2"]))
+            );
+            assert!(lifecycle.state().resolved_at.is_some());
+        }
+    }
+
+    #[test]
+    fn failed_firewall_installation_does_not_publish_a_replacement_dns_cache() {
+        let mut lifecycle =
+            lifecycle_with_settings(PersistedSettings::Valid(dns_refresh_settings()));
+        lifecycle.resolve_all = resolve_old_addresses;
+        lifecycle.run_apply();
+        let previous = lifecycle.state().resolved.clone();
+        let previous_time = lifecycle.state().resolved_at;
+
+        lifecycle.resolve_all = resolve_new_addresses;
+        lifecycle.apply_block = apply_fails;
+        lifecycle.run_apply();
+
+        assert_eq!(lifecycle.state().resolved, previous);
+        assert_eq!(lifecycle.state().resolved_at, previous_time);
+
+        lifecycle.apply_block = apply_ok;
+        lifecycle.resolve_all = resolve_partial_addresses;
+        lifecycle.run_apply();
+        assert_eq!(
+            lifecycle.state().resolved,
+            Some(dns_addresses(&[
+                "203.0.113.1",
+                "2001:db8::1",
+                "203.0.113.2"
+            ]))
+        );
+        assert_eq!(lifecycle.state().resolved_at, None);
+
+        lifecycle.resolve_all = resolve_new_addresses;
+        lifecycle.run_apply();
+        assert_eq!(
+            lifecycle.state().resolved,
+            Some(dns_addresses(&["203.0.113.2", "2001:db8::2"]))
+        );
+        assert!(lifecycle.state().resolved_at.is_some());
+    }
+
+    #[test]
+    fn failed_dns_after_applied_state_persistence_fails_keeps_installed_addresses() {
+        fn install(_: &[String], addresses: &BTreeSet<ResolvedAddr>) -> anyhow::Result<()> {
+            assert!(dns_addresses(&["203.0.113.1", "2001:db8::1"]).is_subset(addresses));
+            Ok(())
+        }
+
+        let settings = Settings::applying(
+            "unrecorded-apply".to_string(),
+            vec!["one.test".to_string(), "two.test".to_string()],
+            60,
+        );
+        let mut lifecycle =
+            lifecycle_with_dependencies(PersistedSettings::Valid(settings), save_fails, install);
+        lifecycle.resolve_all = resolve_old_addresses;
+        lifecycle.run_apply();
+        assert!(!lifecycle.state().valid_settings().unwrap().rules_applied);
+
+        lifecycle.resolve_all = resolve_partial_addresses;
+        lifecycle.run_apply();
+        assert_eq!(
+            lifecycle.state().resolved,
+            Some(dns_addresses(&[
+                "203.0.113.1",
+                "2001:db8::1",
+                "203.0.113.2"
+            ]))
+        );
+        assert_eq!(lifecycle.state().resolved_at, None);
+
+        lifecycle.state().save_settings = save_ok;
+        lifecycle.apply_block = apply_ok;
+        lifecycle.resolve_all = resolve_new_addresses;
+        lifecycle.run_apply();
+        assert_eq!(lifecycle.status().block_phase, protocol::BlockPhase::Active);
+        assert_eq!(
+            lifecycle.state().resolved,
+            Some(dns_addresses(&["203.0.113.2", "2001:db8::2"]))
+        );
     }
 
     #[test]

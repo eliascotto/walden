@@ -266,7 +266,7 @@ fn resolve_hostnames_concurrently(
     cancelled.store(true, Ordering::Release);
     if completed == jobs.len() && failed > 0 {
         eprintln!(
-            "walden: {failed}/{} hostnames could not be resolved; hosts blocking remains active and firewall rules will cover the resolved addresses",
+            "walden: {failed}/{} hostnames could not be resolved; hosts blocking remains active",
             jobs.len()
         );
     }

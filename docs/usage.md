@@ -37,6 +37,13 @@ and `walden stop` during apply stops new lookups from being taken from the
 queue. The platform resolver cannot portably cancel lookups already in flight,
 so at most the bounded worker set may finish before apply exits.
 
+Firewall addresses are refreshed every 15 minutes. If any hostname cannot be
+resolved during a refresh, Walden retains its previous firewall coverage and
+adds any successfully resolved addresses. It retries DNS at the next 15-second
+integrity check. Old addresses are dropped only after a fully successful
+refresh. The first apply still writes hosts entries and blocks any addresses
+it can resolve, then retries failed DNS resolution.
+
 After `walden stop`:
 
 ```text
