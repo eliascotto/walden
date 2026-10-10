@@ -45,6 +45,10 @@ frames with and without a newline, slow-drip deadlines, incomplete frames,
 and consecutive frames. A Start request containing every bundled category
 also round-trips through the same size-limited reader and writer.
 
+Atomic-write tests force a rename failure, repair the destination, and retry
+in the same process. They also check temporary-file cleanup, stale files,
+concurrent writes, and private-file permissions in temporary directories.
+
 The CLI integration suite also exercises catalog selection with an absent,
 empty/incomplete, and invalid update cache. It verifies silent fallback for
 absence, one concise repair notice for recoverable cache damage, no raw
