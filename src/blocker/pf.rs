@@ -65,14 +65,15 @@ fn run_pfctl_output_with(
     Ok(output)
 }
 
-// pfctl reports informational output on stderr, including the -E token.
+// Keep successful-command notices out of table and status query output.
 fn run_pfctl(args: &[&str], what: &str) -> anyhow::Result<String> {
-    let output = run_pfctl_output(args, what)?;
+    run_pfctl_with(Command::new("pfctl").args(args), what)
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+fn run_pfctl_with(command: &mut Command, what: &str) -> anyhow::Result<String> {
+    let output = run_pfctl_output_with(command, what)?;
 
-    Ok(format!("{stdout}{stderr}"))
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 // The pf enable reference count lives in the kernel and resets on reboot, so a
@@ -119,17 +120,29 @@ fn current_token() -> Option<String> {
     }
 }
 
+fn parse_pf_reference_token(output: &std::process::Output) -> anyhow::Result<String> {
+    // pfctl reports its enable token on stderr; accept stdout as well without
+    // joining streams, which could merge an unterminated notice with the token.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr
+        .lines()
+        .chain(stdout.lines())
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("Token :")
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+        })
+        .map(str::to_owned)
+        .context("pfctl -E returned no token")
+}
+
 // `pfctl -E` enables pf and increments its reference count, handing back a
 // token. The reference is held for the whole block, so this only records it.
 fn acquire_pf_reference() -> anyhow::Result<()> {
-    let output = run_pfctl(&["-E"], "acquire PF reference")?;
-
-    let token = output
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("Token :"))
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .context("pfctl -E returned no token")?;
+    let output = run_pfctl_output(&["-E"], "acquire PF reference")?;
+    let token = parse_pf_reference_token(&output)?;
 
     let boot_id = boot_session_id().unwrap_or_default();
 
@@ -527,6 +540,80 @@ mod tests {
     #[test]
     fn empty_pf_output_is_an_empty_address_set() {
         assert!(parse_table_entries("\n  \n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn successful_pf_table_query_keeps_diagnostics_out_of_addresses() {
+        for (addresses, expected) in [
+            (
+                "  192.0.2.1\n  2001:db8::1\n",
+                vec![
+                    AddressRange::host("192.0.2.1".parse().unwrap()),
+                    AddressRange::host("2001:db8::1".parse().unwrap()),
+                ],
+            ),
+            ("", Vec::new()),
+        ] {
+            let output = run_pfctl_with(
+                &mut query_command(addresses, "informational diagnostic\n", "0"),
+                "table show",
+            )
+            .unwrap();
+
+            assert_eq!(parse_table_entries(&output).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn failed_pf_command_preserves_diagnostics_even_with_valid_addresses() {
+        let error = run_pfctl_with(
+            &mut query_command("192.0.2.1\n", "Permission denied", "1"),
+            "table show",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("pfctl table show failed"));
+        assert!(error.to_string().contains("Permission denied"));
+    }
+
+    #[test]
+    fn pf_reference_token_survives_separate_output_streams() {
+        for (stdout, stderr) in [
+            ("", "informational diagnostic\n  Token : 12345\n"),
+            ("notice without a newline", "Token : 12345\n"),
+            ("Token : 12345\n", "informational diagnostic\n"),
+        ] {
+            let output = run_pfctl_output_with(
+                &mut query_command(stdout, stderr, "0"),
+                "acquire PF reference",
+            )
+            .unwrap();
+
+            assert_eq!(parse_pf_reference_token(&output).unwrap(), "12345");
+        }
+    }
+
+    #[test]
+    fn pf_reference_requires_a_successful_command_and_a_nonempty_token() {
+        for stderr in ["informational diagnostic\n", "Token : \n"] {
+            let output =
+                run_pfctl_output_with(&mut query_command("", stderr, "0"), "acquire PF reference")
+                    .unwrap();
+
+            assert!(
+                parse_pf_reference_token(&output)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("returned no token")
+            );
+        }
+        assert!(
+            run_pfctl_output_with(
+                &mut query_command("", "Token : 12345\nPermission denied\n", "1"),
+                "acquire PF reference",
+            )
+            .is_err()
+        );
     }
 
     #[test]

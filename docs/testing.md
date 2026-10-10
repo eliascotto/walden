@@ -40,6 +40,11 @@ tags run that workflow and then `.github/workflows/release.yml`:
 These tests do not start the daemon and do not edit `/etc/hosts`, pf, or
 nftables.
 
+Firewall query tests use harmless commands that emit separate stdout and stderr
+streams. They verify that successful diagnostics cannot corrupt PF table entries
+or nftables JSON, failures retain diagnostic messages, and PF enable tokens are
+still read from stderr.
+
 IPC tests use local socket pairs to cover frame-size boundaries, oversized
 frames with and without a newline, slow-drip deadlines, incomplete frames,
 and consecutive frames. A Start request containing every bundled category

@@ -98,24 +98,23 @@ fn partition_by_family(addrs: &BTreeSet<ResolvedAddr>) -> (Vec<String>, Vec<Stri
     (v4, v6)
 }
 
-// Returns both streams joined, matching how the pf backend reports: nft writes
-// its diagnostics to stderr.
+// Queries return machine-readable stdout; stderr is only used for failure diagnostics.
 fn run_nft(args: &[&str], what: &str) -> anyhow::Result<String> {
-    let output = Command::new("nft")
-        .args(args)
+    run_nft_with(Command::new("nft").args(args), what)
+}
+
+fn run_nft_with(command: &mut Command, what: &str) -> anyhow::Result<String> {
+    let output = command
         .output()
         .with_context(|| format!("failed to run nft: {what}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
 
     anyhow::ensure!(
         output.status.success(),
         "nft {what} failed: {}",
-        stderr.trim()
+        String::from_utf8_lossy(&output.stderr).trim()
     );
 
-    Ok(format!("{stdout}{stderr}"))
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn table_exists() -> anyhow::Result<bool> {
@@ -945,6 +944,52 @@ mod tests {
             ))
             .unwrap()
         );
+    }
+
+    #[test]
+    fn successful_nft_queries_keep_diagnostics_out_of_json() {
+        for (elements, expected) in [
+            (
+                r#", "elem": ["192.0.2.1"]"#,
+                vec![AddressRange::host("192.0.2.1".parse().unwrap())],
+            ),
+            ("", Vec::new()),
+        ] {
+            let document = set_output(NFT_SET_V4, "ipv4_addr", elements);
+            let output = run_nft_with(
+                &mut query_command(&document, "informational diagnostic\n", "0"),
+                "list set",
+            )
+            .unwrap();
+
+            assert_eq!(
+                parse_nft_set(&output, NFT_SET_V4, "ipv4_addr").unwrap(),
+                expected
+            );
+        }
+
+        let output = run_nft_with(
+            &mut query_command(
+                &valid_rules_document().to_string(),
+                "informational diagnostic\n",
+                "0",
+            ),
+            "list table",
+        )
+        .unwrap();
+        assert!(parse_rules_match(&output).unwrap());
+    }
+
+    #[test]
+    fn failed_nft_command_preserves_diagnostics_even_with_valid_json() {
+        let error = run_nft_with(
+            &mut query_command(r#"{"nftables":[]}"#, "Operation not permitted", "1"),
+            "list set",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("nft list set failed"));
+        assert!(error.to_string().contains("Operation not permitted"));
     }
 
     #[test]
