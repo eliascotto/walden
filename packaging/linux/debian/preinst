@@ -18,11 +18,8 @@ MARKER="${WALDEN_UPGRADE_MARKER:-/run/walden-upgrade-restart}"
 
 case "$1" in
   upgrade)
-    # A note left over from an interrupted upgrade would restart a daemon
-    # nobody asked to run, so the record starts empty rather than being
-    # trusted from a previous attempt.
-    rm -f "$MARKER"
-
+    # Keep any pending restart from an interrupted or failed upgrade, even
+    # when its daemon is no longer running. postinst clears it after success.
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SERVICE"; then
       mkdir -p "$(dirname "$MARKER")"
       : >"$MARKER"

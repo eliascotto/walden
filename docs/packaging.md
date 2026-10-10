@@ -193,10 +193,11 @@ An upgrade replaces the package's files through the platform installer and puts
 back exactly what it interrupted.
 
 - The installation is asked, before anything is replaced, whether a daemon is
-  running. That answer is the only thing that decides what happens next,
+  running. A running daemon is recorded in a restart marker,
   because afterwards a daemon stopped by the upgrade and one that was never
   started look the same.
-- An inactive installation stays inactive. Nothing is enabled or started.
+- An inactive installation without a pending restart stays inactive. Nothing
+  is enabled or started.
 - An active daemon is restarted on the new version and resumes the block from
   its persisted state: the same deadline, the same blocklist, the same unlock
   delay. An upgrade cannot reset, shorten, or remove an active block. Replacing
@@ -207,7 +208,9 @@ back exactly what it interrupted.
   machine is not unblocked in between.
 - If the daemon cannot be restarted, the upgrade fails and says so. A machine
   left with a block's rules in place and no daemon to expire them is worse than
-  an upgrade that stops.
+  an upgrade that stops. The restart marker survives failures and installer
+  retries, even if the daemon is now inactive. It is removed only after the
+  service manager successfully restarts or loads the daemon.
 
 ### Persisted state across versions
 

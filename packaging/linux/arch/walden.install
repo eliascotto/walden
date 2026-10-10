@@ -20,8 +20,7 @@ post_install() {
 # replaced the executable a daemon that was stopped by the upgrade is
 # indistinguishable from one that was never started.
 pre_upgrade() {
-  rm -f "$_marker"
-
+  # Preserve a pending restart if an earlier upgrade left the daemon inactive.
   if systemctl is-active --quiet "$_service"; then
     mkdir -p "$(dirname "$_marker")"
     : >"$_marker"
@@ -34,9 +33,9 @@ pre_upgrade() {
 # stops and says so.
 post_upgrade() {
   if [ -e "$_marker" ]; then
-    rm -f "$_marker"
     echo "Walden was running a block; restarting its daemon on the new version."
-    systemctl restart "$_service"
+    systemctl restart "$_service" || return $?
+    rm -f "$_marker"
   fi
 }
 

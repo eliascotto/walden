@@ -27,9 +27,9 @@ case "$1" in
     fi
 
     if [ -e "$MARKER" ]; then
-      rm -f "$MARKER"
       echo "Walden was running a block; restarting its daemon on the new version."
       systemctl restart "$SERVICE"
+      rm -f "$MARKER"
     elif [ -z "${2:-}" ]; then
       echo "Walden is installed and inactive. Run 'walden start' to begin a block."
     fi

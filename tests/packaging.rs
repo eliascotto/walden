@@ -243,6 +243,8 @@ case "$1" in
     fi
     exit 113
     ;;
+  enable) exit "${STUB_ENABLE_EXIT:-0}" ;;
+  bootstrap) exit "${STUB_BOOTSTRAP_EXIT:-0}" ;;
 esac
 exit 0
 "#;
@@ -333,17 +335,24 @@ impl Sandbox {
 
     // pacman sources the scriptlet and calls one function out of it, which is
     // the only way its functions can be run.
-    fn run_arch(&self, function: &str, active: &str) -> Output {
+    fn arch_command(&self, function: &str) -> Command {
         let scriptlet = repo_root().join("packaging/linux/arch/walden.install");
 
-        Command::new("sh")
+        let mut command = Command::new("sh");
+        command
             .arg("-c")
             .arg(format!(". \"{}\"; {function}", scriptlet.display()))
             .env("PATH", self.search_path())
             .env("STUB_LOG", self.log())
             .env("WALDEN_UPGRADE_MARKER", self.marker())
+            .env("STUB_SERVICE_IS_ACTIVE", INACTIVE)
+            .current_dir(&self.root);
+        command
+    }
+
+    fn run_arch(&self, function: &str, active: &str) -> Output {
+        self.arch_command(function)
             .env("STUB_SERVICE_IS_ACTIVE", active)
-            .current_dir(&self.root)
             .output()
             .unwrap_or_else(|err| panic!("failed to run {function}: {err}"))
     }
@@ -467,29 +476,72 @@ fn upgrading_the_debian_package_puts_back_only_a_daemon_that_was_running() {
     );
 }
 
-// A machine left with a block's rules in place and no daemon to expire them is
-// worse than an upgrade that stops and says so, so the restart is not allowed
-// to fail quietly.
+// A failed restart must leave the note for both a configuration retry and a
+// full upgrade retry, even though the interrupted daemon is now inactive.
 #[test]
-fn an_upgrade_that_cannot_restart_the_daemon_fails() {
-    let sandbox = Sandbox::new("deb-upgrade-restart-fails");
-    sandbox.run(
-        "packaging/linux/debian/preinst",
-        &["upgrade", "0.0.9"],
-        ACTIVE,
-    );
+fn a_failed_debian_upgrade_keeps_the_restart_pending_until_retry_succeeds() {
+    for repeat_preinst in [false, true] {
+        let sandbox = Sandbox::new("deb-upgrade-retry");
+        let preinst = sandbox.run(
+            "packaging/linux/debian/preinst",
+            &["upgrade", "0.0.9"],
+            ACTIVE,
+        );
+        assert!(succeeded(&preinst), "{}", stderr(&preinst));
 
-    let output = sandbox
-        .command("packaging/linux/debian/postinst")
-        .args(["configure", "0.0.9"])
-        .env("STUB_RESTART_EXIT", "1")
-        .output()
-        .unwrap();
+        let failed = sandbox
+            .command("packaging/linux/debian/postinst")
+            .args(["configure", "0.0.9"])
+            .env("STUB_RESTART_EXIT", "17")
+            .output()
+            .unwrap();
+        assert_eq!(failed.status.code(), Some(17));
+        assert!(sandbox.marker().exists(), "a failed restart lost its note");
 
-    assert!(
-        !succeeded(&output),
-        "the upgrade reported success after failing to restart an interrupted daemon"
-    );
+        if repeat_preinst {
+            let preinst = sandbox.run(
+                "packaging/linux/debian/preinst",
+                &["upgrade", "0.0.9"],
+                INACTIVE,
+            );
+            assert!(succeeded(&preinst), "{}", stderr(&preinst));
+            assert!(
+                sandbox.marker().exists(),
+                "preinst lost the pending restart"
+            );
+        }
+
+        let retried = sandbox.run(
+            "packaging/linux/debian/postinst",
+            &["configure", "0.0.9"],
+            INACTIVE,
+        );
+        assert!(succeeded(&retried), "{}", stderr(&retried));
+        assert!(!sandbox.marker().exists());
+        assert_eq!(
+            sandbox
+                .commands()
+                .matches("systemctl restart waldend.service")
+                .count(),
+            2,
+            "the retry did not restart the interrupted daemon"
+        );
+
+        let completed = sandbox.run(
+            "packaging/linux/debian/postinst",
+            &["configure", "0.0.9"],
+            INACTIVE,
+        );
+        assert!(succeeded(&completed), "{}", stderr(&completed));
+        assert_eq!(
+            sandbox
+                .commands()
+                .matches("systemctl restart waldend.service")
+                .count(),
+            2,
+            "a completed upgrade restarted the daemon again"
+        );
+    }
 }
 
 // Removing Walden mid-block stops the daemon but leaves the hosts entries and
@@ -629,6 +681,106 @@ fn upgrading_the_macos_package_puts_back_a_daemon_it_interrupted() {
         "{commands}"
     );
     assert!(!sandbox.marker().exists());
+}
+
+#[test]
+fn a_failed_macos_upgrade_keeps_the_restart_pending_until_retry_succeeds() {
+    for failure in ["STUB_ENABLE_EXIT", "STUB_BOOTSTRAP_EXIT"] {
+        for repeat_preinstall in [false, true] {
+            let sandbox = Sandbox::new("macos-upgrade-retry");
+            let preinstall = sandbox.run("packaging/macos/scripts/preinstall", &[], ACTIVE);
+            assert!(succeeded(&preinstall), "{}", stderr(&preinstall));
+
+            let failed = sandbox
+                .command("packaging/macos/scripts/postinstall")
+                .env(failure, "17")
+                .output()
+                .unwrap();
+            assert_eq!(failed.status.code(), Some(17), "{failure}");
+            assert!(
+                sandbox.marker().exists(),
+                "a failed {failure} lost the pending restart"
+            );
+            let bootstrap =
+                "launchctl bootstrap system /Library/LaunchDaemons/org.scotto.waldend.plist";
+            assert_eq!(
+                sandbox.commands().matches(bootstrap).count(),
+                usize::from(failure == "STUB_BOOTSTRAP_EXIT"),
+                "bootstrap must wait for enable to succeed"
+            );
+
+            if repeat_preinstall {
+                let preinstall = sandbox.run("packaging/macos/scripts/preinstall", &[], INACTIVE);
+                assert!(succeeded(&preinstall), "{}", stderr(&preinstall));
+                assert!(
+                    sandbox.marker().exists(),
+                    "preinstall lost the pending restart"
+                );
+            }
+
+            let retried = sandbox.run("packaging/macos/scripts/postinstall", &[], INACTIVE);
+            assert!(succeeded(&retried), "{}", stderr(&retried));
+            assert!(!sandbox.marker().exists());
+            let commands = sandbox.commands();
+            assert_eq!(
+                commands
+                    .matches("launchctl enable system/org.scotto.waldend")
+                    .count(),
+                2
+            );
+            assert_eq!(
+                commands.matches(bootstrap).count(),
+                1 + usize::from(failure == "STUB_BOOTSTRAP_EXIT"),
+                "the retry did not reload the interrupted daemon"
+            );
+
+            let completed = sandbox.run("packaging/macos/scripts/postinstall", &[], INACTIVE);
+            assert!(succeeded(&completed), "{}", stderr(&completed));
+            assert_eq!(sandbox.commands(), commands);
+        }
+    }
+}
+
+#[test]
+fn a_failed_arch_upgrade_keeps_the_restart_pending_until_retry_succeeds() {
+    for repeat_pre_upgrade in [false, true] {
+        let sandbox = Sandbox::new("arch-upgrade-retry");
+        let pre_upgrade = sandbox.run_arch("pre_upgrade", ACTIVE);
+        assert!(succeeded(&pre_upgrade), "{}", stderr(&pre_upgrade));
+
+        let failed = sandbox
+            .arch_command("post_upgrade")
+            .env("STUB_RESTART_EXIT", "17")
+            .output()
+            .unwrap();
+        assert_eq!(failed.status.code(), Some(17));
+        assert!(sandbox.marker().exists(), "a failed restart lost its note");
+
+        if repeat_pre_upgrade {
+            let pre_upgrade = sandbox.run_arch("pre_upgrade", INACTIVE);
+            assert!(succeeded(&pre_upgrade), "{}", stderr(&pre_upgrade));
+            assert!(
+                sandbox.marker().exists(),
+                "pre_upgrade lost the pending restart"
+            );
+        }
+
+        let retried = sandbox.run_arch("post_upgrade", INACTIVE);
+        assert!(succeeded(&retried), "{}", stderr(&retried));
+        assert!(!sandbox.marker().exists());
+        let commands = sandbox.commands();
+        assert_eq!(
+            commands
+                .matches("systemctl restart waldend.service")
+                .count(),
+            2,
+            "the retry did not restart the interrupted daemon"
+        );
+
+        let completed = sandbox.run_arch("post_upgrade", INACTIVE);
+        assert!(succeeded(&completed), "{}", stderr(&completed));
+        assert_eq!(sandbox.commands(), commands);
+    }
 }
 
 // pacman's scriptlet is the Arch spelling of the Debian maintainer scripts and

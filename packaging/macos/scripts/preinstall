@@ -18,10 +18,8 @@ LABEL="org.scotto.waldend"
 TARGET="system/${LABEL}"
 MARKER="${WALDEN_UPGRADE_MARKER:-/private/var/run/org.scotto.walden.upgrade}"
 
-# A stale note would restart a daemon nobody asked to run, so the record starts
-# empty every time rather than being trusted from a previous installation.
-rm -f "$MARKER"
-
+# Keep any pending restart from an interrupted or failed upgrade, even when
+# its daemon is no longer running. postinstall clears it after success.
 if launchctl print "$TARGET" 2>/dev/null |
   grep -Eq '^[[:space:]]*(state = running|pid = [0-9]+)'; then
   mkdir -p "$(dirname "$MARKER")"

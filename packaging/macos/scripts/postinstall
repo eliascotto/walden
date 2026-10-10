@@ -20,8 +20,6 @@ if [ ! -e "$MARKER" ]; then
   exit 0
 fi
 
-rm -f "$MARKER"
-
 echo "Walden was running a block; restarting its daemon on the new version."
 
 # The job ships disabled so that installing Walden does not start it, and the
@@ -30,5 +28,6 @@ echo "Walden was running a block; restarting its daemon on the new version."
 # but it is re-asserted here rather than assumed.
 launchctl enable "$TARGET"
 launchctl bootstrap system "$JOB"
+rm -f "$MARKER"
 
 exit 0
