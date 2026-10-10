@@ -114,6 +114,10 @@ sends one direct request. Its response distinguishes an inactive block, a
 cancelled apply, a newly scheduled ending, and an ending already in progress.
 The socket server has a fixed worker pool and bounded pending queue, so stalled
 local clients cannot create an unbounded number of daemon threads.
+Each newline-terminated JSON frame is limited to 16 MiB before the newline and
+must arrive within five seconds, even if the peer keeps sending bytes. Client
+readiness probes use a shorter one-second deadline. Oversized or incomplete
+frames are rejected; the limit accommodates the entire bundled catalog.
 
 A missing or incomplete installation stops this at step 2. Nothing on the
 machine has changed at that point, and no block has been accepted. The unlock

@@ -201,9 +201,10 @@ fn daemon_probe() -> DaemonProbe {
             Some(ipc::IpcError::DeadlineExceeded)
             | Some(ipc::IpcError::Disconnected)
             | Some(ipc::IpcError::Io { .. }) => DaemonProbe::Unreachable,
-            Some(ipc::IpcError::InvalidMessage(_)) | Some(ipc::IpcError::Serialize(_)) | None => {
-                DaemonProbe::Incompatible(format!("{err:#}"))
-            }
+            Some(ipc::IpcError::InvalidMessage(_))
+            | Some(ipc::IpcError::MessageTooLarge { .. })
+            | Some(ipc::IpcError::Serialize(_))
+            | None => DaemonProbe::Incompatible(format!("{err:#}")),
         };
     }
     if ipc::send_json(&mut stream, &protocol::ClientMessage::Status).is_err() {
@@ -213,6 +214,9 @@ fn daemon_probe() -> DaemonProbe {
         Ok(status) => DaemonProbe::Responsive(status),
         Err(ipc::IpcError::InvalidMessage(err)) => {
             DaemonProbe::Incompatible(format!("the daemon returned invalid status: {err}"))
+        }
+        Err(err @ ipc::IpcError::MessageTooLarge { .. }) => {
+            DaemonProbe::Incompatible(err.to_string())
         }
         Err(_) => DaemonProbe::Unreachable,
     }

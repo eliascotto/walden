@@ -5,18 +5,21 @@ use anyhow::{Context, Result};
 use serde::{Serialize, de::DeserializeOwned};
 use std::fmt;
 use std::fs::{self, Permissions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc::{self, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // Long enough for a client that means to say something, short enough that one
-// that never does cannot hold the accept loop.
+// that never finishes a frame cannot hold a worker indefinitely.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+// JSON payload bytes, excluding the newline. Fits the entire bundled catalog
+// in one Start request, with room for custom websites.
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const SERVER_WORKERS: usize = 8;
 const PENDING_CLIENTS: usize = 16;
 
@@ -24,6 +27,9 @@ const PENDING_CLIENTS: usize = 16;
 pub enum IpcError {
     DeadlineExceeded,
     Disconnected,
+    MessageTooLarge {
+        limit: usize,
+    },
     Io {
         action: &'static str,
         source: std::io::Error,
@@ -67,6 +73,12 @@ impl fmt::Display for IpcError {
                 )
             }
             Self::Disconnected => write!(formatter, "the daemon closed the IPC connection"),
+            Self::MessageTooLarge { limit } => {
+                write!(
+                    formatter,
+                    "the IPC message exceeds the {limit}-byte size limit"
+                )
+            }
             Self::Io { action, source } => write!(formatter, "{action}: {source}"),
             Self::Serialize(source) => {
                 write!(formatter, "failed to serialize IPC message: {source}")
@@ -86,7 +98,7 @@ impl std::error::Error for IpcError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Serialize(source) | Self::InvalidMessage(source) => Some(source),
-            Self::DeadlineExceeded | Self::Disconnected => None,
+            Self::DeadlineExceeded | Self::Disconnected | Self::MessageTooLarge { .. } => None,
         }
     }
 }
@@ -249,6 +261,11 @@ pub fn connect_client_with_timeout(timeout: Duration) -> IpcResult<UnixStream> {
 
 pub fn send_json<T: Serialize>(stream: &mut UnixStream, value: &T) -> IpcResult<()> {
     let line = serde_json::to_string(value).map_err(IpcError::Serialize)?;
+    if line.len() > MAX_FRAME_BYTES {
+        return Err(IpcError::MessageTooLarge {
+            limit: MAX_FRAME_BYTES,
+        });
+    }
     writeln!(stream, "{}", line)
         .map_err(|err| IpcError::from_io("failed to write the IPC message", err))?;
     stream
@@ -258,20 +275,113 @@ pub fn send_json<T: Serialize>(stream: &mut UnixStream, value: &T) -> IpcResult<
 }
 
 pub fn receive_json<T: DeserializeOwned>(stream: &mut UnixStream) -> IpcResult<T> {
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    let bytes = reader
-        .read_line(&mut line)
-        .map_err(|err| IpcError::from_io("failed to read the IPC message", err))?;
-    if bytes == 0 {
-        return Err(IpcError::Disconnected);
+    let timeout = stream
+        .read_timeout()
+        .map_err(|err| IpcError::from_io("failed to get the IPC read timeout", err))?;
+    let deadline = Instant::now() + timeout.unwrap_or(CLIENT_TIMEOUT);
+    let frame = read_frame(stream, deadline)?;
+    serde_json::from_slice(&frame).map_err(IpcError::InvalidMessage)
+}
+
+fn read_frame(stream: &mut UnixStream, deadline: Instant) -> IpcResult<Vec<u8>> {
+    let mut frame = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        // Peek to find the first newline without consuming the next frame.
+        // A temporary BufReader would discard any bytes it read past it.
+        let available = receive_bytes(stream, &mut chunk, libc::MSG_PEEK, deadline)?;
+        let count = chunk[..available]
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(available, |index| index + 1);
+
+        let bytes = receive_bytes(stream, &mut chunk[..count], 0, deadline)?;
+        let complete = chunk[bytes - 1] == b'\n';
+        let payload_bytes = bytes - usize::from(complete);
+        if payload_bytes > MAX_FRAME_BYTES - frame.len() {
+            return Err(IpcError::MessageTooLarge {
+                limit: MAX_FRAME_BYTES,
+            });
+        }
+        frame.extend_from_slice(&chunk[..payload_bytes]);
+        if complete {
+            return Ok(frame);
+        }
     }
-    serde_json::from_str(line.trim_end()).map_err(IpcError::InvalidMessage)
+}
+
+// Poll with the remaining budget, then read without blocking. This keeps the
+// socket's configured timeout intact and also works after the peer closes
+// (macOS rejects changing SO_RCVTIMEO on that socket, even with unread data).
+fn receive_bytes(
+    stream: &UnixStream,
+    buffer: &mut [u8],
+    flags: libc::c_int,
+    deadline: Instant,
+) -> IpcResult<usize> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(IpcError::DeadlineExceeded);
+        }
+        // Round up to milliseconds so a sub-millisecond budget stays finite.
+        let timeout_ms = remaining
+            .as_millis()
+            .saturating_add(1)
+            .min(i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `descriptor` is a valid pollfd borrowing a live socket, and
+        // remains writable for the duration of this call.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(IpcError::from_io("failed to wait for the IPC message", err));
+        }
+        if ready == 0 {
+            continue;
+        }
+        // SAFETY: the socket is borrowed from `stream`, and `buffer` is
+        // writable for the requested length throughout this call.
+        let bytes = unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                flags | libc::MSG_DONTWAIT,
+            )
+        };
+        if bytes < 0 {
+            let err = std::io::Error::last_os_error();
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            ) {
+                continue;
+            }
+            return Err(IpcError::from_io("failed to read the IPC message", err));
+        }
+        if Instant::now() >= deadline {
+            return Err(IpcError::DeadlineExceeded);
+        }
+        if bytes == 0 {
+            // Even valid JSON is incomplete until its newline arrives.
+            return Err(IpcError::Disconnected);
+        }
+        return Ok(bytes as usize);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Start is root-only; peer_uid is the enforcement point.
@@ -297,6 +407,214 @@ mod tests {
             error.to_string(),
             "the daemon did not answer before the IPC deadline"
         );
+    }
+
+    #[test]
+    fn a_frame_at_the_size_limit_round_trips() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let value = "x".repeat(MAX_FRAME_BYTES - 2); // JSON string quotes count too.
+        let sender = thread::spawn(move || {
+            writer.set_write_timeout(Some(CLIENT_TIMEOUT)).unwrap();
+            send_json(&mut writer, &value).unwrap();
+        });
+
+        let received: String = receive_json(&mut reader).unwrap();
+        assert_eq!(received.len(), MAX_FRAME_BYTES - 2);
+        assert!(received.bytes().all(|byte| byte == b'x'));
+        assert_eq!(reader.read_timeout().unwrap(), None);
+        sender.join().unwrap();
+    }
+
+    // Keep the peer open after writing, so an unterminated frame cannot rely
+    // on EOF to finish the read. The write timeout bounds a failed test too.
+    fn send_frame(frame: Vec<u8>) -> (UnixStream, thread::JoinHandle<UnixStream>) {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_read_timeout(Some(CLIENT_TIMEOUT)).unwrap();
+        let sender = thread::spawn(move || {
+            writer.set_write_timeout(Some(CLIENT_TIMEOUT)).unwrap();
+            writer.write_all(&frame).unwrap();
+            writer
+        });
+        (reader, sender)
+    }
+
+    #[test]
+    fn oversized_frames_are_rejected_with_or_without_a_newline() {
+        for terminated in [false, true] {
+            let mut frame = vec![b'x'; MAX_FRAME_BYTES + 1];
+            frame[0] = b'"';
+            frame[MAX_FRAME_BYTES] = b'"';
+            if terminated {
+                frame.push(b'\n');
+            }
+            let (mut reader, sender) = send_frame(frame);
+
+            let result = receive_json::<String>(&mut reader);
+            assert!(
+                matches!(
+                    result,
+                    Err(IpcError::MessageTooLarge {
+                        limit: MAX_FRAME_BYTES
+                    })
+                ),
+                "{result:?}"
+            );
+            assert_eq!(reader.read_timeout().unwrap(), Some(CLIENT_TIMEOUT));
+            sender.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn an_oversized_outgoing_frame_writes_nothing() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+
+        let result = send_json(&mut writer, &"x".repeat(MAX_FRAME_BYTES - 1));
+        assert!(matches!(result, Err(IpcError::MessageTooLarge { .. })));
+        assert_eq!(
+            reader.read(&mut [0_u8; 1]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn reading_one_frame_leaves_the_next_frame_on_the_socket() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let timeout = Duration::from_millis(200);
+        reader.set_read_timeout(Some(timeout)).unwrap();
+        writer.write_all(b"\"Status\"\n\"Stop\"\n").unwrap();
+
+        assert_eq!(receive_json::<String>(&mut reader).unwrap(), "Status");
+        assert_eq!(reader.read_timeout().unwrap(), Some(timeout));
+        assert_eq!(receive_json::<String>(&mut reader).unwrap(), "Stop");
+        assert_eq!(reader.read_timeout().unwrap(), Some(timeout));
+    }
+
+    #[test]
+    fn eof_cannot_complete_an_unterminated_frame() {
+        for frame in [b"null".as_slice(), b""] {
+            let (mut reader, mut writer) = UnixStream::pair().unwrap();
+            writer.write_all(frame).unwrap();
+            writer.shutdown(std::net::Shutdown::Write).unwrap();
+
+            assert!(matches!(
+                receive_json::<serde_json::Value>(&mut reader),
+                Err(IpcError::Disconnected)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_complete_frame_from_a_closed_peer_is_accepted() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"null\n").unwrap();
+        drop(writer);
+
+        assert_eq!(
+            receive_json::<serde_json::Value>(&mut reader).unwrap(),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn invalid_json_and_utf8_are_typed_invalid_messages() {
+        for frame in [b"{]\n".as_slice(), b"\"\xff\"\n"] {
+            let (mut reader, mut writer) = UnixStream::pair().unwrap();
+            writer.write_all(frame).unwrap();
+
+            assert!(matches!(
+                receive_json::<serde_json::Value>(&mut reader),
+                Err(IpcError::InvalidMessage(_))
+            ));
+            assert_eq!(reader.read_timeout().unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn fragmented_utf8_and_crlf_frames_are_accepted() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let sender = thread::spawn(move || {
+            writer.write_all(b"\"\xf0\x9f").unwrap();
+            thread::sleep(Duration::from_millis(10));
+            writer.write_all(b"\x8c\xb2\"\r\n").unwrap();
+        });
+
+        assert_eq!(receive_json::<String>(&mut reader).unwrap(), "🌲");
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn the_entire_bundled_catalog_fits_in_a_start_request() {
+        let catalog = crate::catalog::Catalog::open(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/walden-list/v1"),
+        )
+        .unwrap();
+        let block_list = catalog
+            .category_ids()
+            .flat_map(|id| catalog.domains(id).unwrap().iter().cloned())
+            .collect();
+        let request = crate::protocol::ClientMessage::Start {
+            operation_id: "catalog-round-trip".to_string(),
+            block_list,
+            unlock_delay_secs: 30,
+        };
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let sender = thread::spawn(move || {
+            writer.set_write_timeout(Some(CLIENT_TIMEOUT)).unwrap();
+            send_json(&mut writer, &request).unwrap();
+            request
+        });
+
+        let received = receive_json::<crate::protocol::ClientMessage>(&mut reader).unwrap();
+        let expected = sender.join().unwrap();
+        match (received, expected) {
+            (
+                crate::protocol::ClientMessage::Start {
+                    operation_id,
+                    block_list,
+                    unlock_delay_secs,
+                },
+                crate::protocol::ClientMessage::Start {
+                    operation_id: expected_id,
+                    block_list: expected_list,
+                    unlock_delay_secs: expected_delay,
+                },
+            ) => {
+                assert_eq!(operation_id, expected_id);
+                assert_eq!(block_list, expected_list);
+                assert_eq!(unlock_delay_secs, expected_delay);
+            }
+            _ => panic!("expected a Start request"),
+        }
+    }
+
+    #[test]
+    fn slow_drip_input_cannot_extend_the_read_deadline() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let timeout = Duration::from_millis(200);
+        reader.set_read_timeout(Some(timeout)).unwrap();
+        let sender = thread::spawn(move || {
+            for _ in 0..60 {
+                if writer.write_all(b" ").is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let _ = writer.write_all(b"null\n");
+        });
+
+        let started = Instant::now();
+        let result = receive_json::<serde_json::Value>(&mut reader);
+        let elapsed = started.elapsed();
+        assert_eq!(reader.read_timeout().unwrap(), Some(timeout));
+        drop(reader);
+        sender.join().unwrap();
+
+        assert!(
+            matches!(result, Err(IpcError::DeadlineExceeded)),
+            "{result:?}"
+        );
+        assert!(elapsed < Duration::from_millis(600), "{elapsed:?}");
     }
 
     #[test]

@@ -40,6 +40,11 @@ tags run that workflow and then `.github/workflows/release.yml`:
 These tests do not start the daemon and do not edit `/etc/hosts`, pf, or
 nftables.
 
+IPC tests use local socket pairs to cover frame-size boundaries, oversized
+frames with and without a newline, slow-drip deadlines, incomplete frames,
+and consecutive frames. A Start request containing every bundled category
+also round-trips through the same size-limited reader and writer.
+
 The CLI integration suite also exercises catalog selection with an absent,
 empty/incomplete, and invalid update cache. It verifies silent fallback for
 absence, one concise repair notice for recoverable cache damage, no raw
