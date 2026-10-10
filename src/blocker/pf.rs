@@ -44,21 +44,27 @@ fn to_table_entry(addr: &ResolvedAddr) -> String {
     }
 }
 
-// pfctl reports informational output on stderr, including the -E token.
-fn run_pfctl(args: &[&str], what: &str) -> anyhow::Result<String> {
+fn run_pfctl_output(args: &[&str], what: &str) -> anyhow::Result<std::process::Output> {
     let output = Command::new("pfctl")
         .args(args)
         .output()
         .with_context(|| format!("failed to run pfctl: {what}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
     anyhow::ensure!(
         output.status.success(),
         "pfctl {what} failed: {}",
-        stderr.trim()
+        String::from_utf8_lossy(&output.stderr).trim()
     );
+
+    Ok(output)
+}
+
+// pfctl reports informational output on stderr, including the -E token.
+fn run_pfctl(args: &[&str], what: &str) -> anyhow::Result<String> {
+    let output = run_pfctl_output(args, what)?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
     Ok(format!("{stdout}{stderr}"))
 }
@@ -177,34 +183,73 @@ fn pf_conf_has_anchor() -> anyhow::Result<ConfigStatus> {
     }
 }
 
+fn parse_parent_anchor_is_loaded(output: &str) -> bool {
+    let expected = format!("anchor \"{PF_ANCHOR}\" all");
+
+    output
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| line.split_whitespace().eq(expected.split_whitespace()))
+}
+
 // Whether the *running* ruleset evaluates our anchor. /etc/pf.conf can name the
 // anchor while the loaded ruleset does not, if something flushed or replaced
 // the ruleset after boot.
 fn anchor_is_loaded() -> bool {
-    let (anchor_line, _) = anchor_lines();
-
-    run_pfctl(&["-s", "rules"], "list rules")
-        .map(|rules| {
-            rules
-                .lines()
-                .any(|line| line.trim().starts_with(anchor_line.as_str()))
+    run_pfctl_output(&["-s", "rules"], "list rules")
+        .map(|output| {
+            let rules = String::from_utf8_lossy(&output.stdout);
+            parse_parent_anchor_is_loaded(&rules)
         })
         .unwrap_or(false)
 }
 
-fn append_anchor_to_pf_conf() -> anyhow::Result<()> {
-    let mut conf = fs::read_to_string(PF_CONF_FILE)
+fn pf_conf_with_anchor(conf: &str) -> String {
+    let (anchor_line, load_line) = anchor_lines();
+    let load_prefix = format!("load anchor \"{PF_ANCHOR}\"");
+
+    // Remove our previous entries before inserting the pair again.
+    let mut lines: Vec<&str> = conf
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.starts_with(anchor_line.as_str()) && !line.starts_with(load_prefix.as_str())
+        })
+        .collect();
+
+    // Keep options and translation rules before filtering rules.
+    let position = lines
+        .iter()
+        .position(|line| {
+            matches!(
+                line.split_whitespace().next(),
+                Some("anchor" | "block" | "pass" | "antispoof")
+            )
+        })
+        .unwrap_or(lines.len());
+
+    lines.insert(position, &anchor_line);
+    lines.push(&load_line);
+
+    let mut updated = lines.join("\n");
+    updated.push('\n');
+    updated
+}
+
+fn ensure_pf_conf_anchor() -> anyhow::Result<bool> {
+    let conf = fs::read_to_string(PF_CONF_FILE)
         .with_context(|| format!("failed to read {PF_CONF_FILE}"))?;
 
-    if !conf.ends_with('\n') {
-        conf.push('\n');
+    let updated = pf_conf_with_anchor(&conf);
+
+    if updated == conf {
+        return Ok(false);
     }
 
-    let (anchor_line, load_line) = anchor_lines();
-    conf.push_str(&format!("{anchor_line}\n{load_line}\n"));
+    common::write_atomically(PF_CONF_FILE, updated.as_bytes())
+        .with_context(|| format!("failed to update {PF_CONF_FILE}"))?;
 
-    common::write_atomically(PF_CONF_FILE, conf.as_bytes())
-        .with_context(|| format!("failed to update {PF_CONF_FILE}"))
+    Ok(true)
 }
 
 // Drops our lines from /etc/pf.conf without touching the running ruleset.
@@ -242,23 +287,16 @@ fn ensure_anchor_wired() -> anyhow::Result<()> {
     common::write_atomically(PF_ANCHOR_FILE, pf_anchor_rules().as_bytes())
         .with_context(|| format!("failed to write {PF_ANCHOR_FILE}"))?;
 
-    let conf_changed = match pf_conf_has_anchor()? {
-        ConfigStatus::Present => false,
-        // Only one of the two lines survived: drop it and re-add the pair.
-        ConfigStatus::Partial => {
-            strip_anchor_from_pf_conf()?;
-            append_anchor_to_pf_conf()?;
-            true
-        }
-        ConfigStatus::Absent => {
-            append_anchor_to_pf_conf()?;
-            true
-        }
-    };
+    let conf_changed = ensure_pf_conf_anchor()?;
 
     if conf_changed || !anchor_is_loaded() {
         run_pfctl(&["-f", PF_CONF_FILE], "load pf.conf")?;
     }
+
+    anyhow::ensure!(
+        anchor_is_loaded(),
+        "Walden's anchor is not the first live PF filtering rule"
+    );
 
     // Recreates the table and the block rule inside the anchor.
     run_pfctl(
@@ -350,6 +388,23 @@ fn table_matches(resolved_addrs: &BTreeSet<ResolvedAddr>) -> anyhow::Result<bool
     Ok(active == expected)
 }
 
+fn parse_anchor_rules_match(output: &str) -> bool {
+    let expected = format!("block return out quick from any to <{PF_TABLE}>");
+
+    let actual_words = output.split_whitespace().collect::<Vec<_>>();
+    let expected_words = expected.split_whitespace().collect::<Vec<_>>();
+
+    actual_words == expected_words
+}
+
+fn anchor_rules_match() -> anyhow::Result<bool> {
+    let output = run_pfctl_output(&["-a", PF_ANCHOR, "-s", "rules"], "list anchor rules")?;
+
+    let rules = String::from_utf8_lossy(&output.stdout);
+
+    Ok(parse_anchor_rules_match(&rules))
+}
+
 // Whether the block is still installed, checked from the outside in: pf turned
 // on, the anchor named in /etc/pf.conf, its rules file on disk, the anchor live
 // in the running ruleset, and addresses in its table. Partial means something
@@ -368,6 +423,11 @@ pub fn status(resolved_addrs: &BTreeSet<ResolvedAddr>) -> ConfigStatus {
 
     if !Path::new(PF_ANCHOR_FILE).exists() || !anchor_is_loaded() {
         return ConfigStatus::Absent;
+    }
+
+    match anchor_rules_match() {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return ConfigStatus::Partial,
     }
 
     match table_matches(resolved_addrs) {
@@ -457,5 +517,111 @@ mod tests {
             parse_table_entries("192.0.2.1\n").unwrap(),
             Vec::<AddressRange>::new()
         );
+    }
+
+    #[test]
+    fn expected_anchor_rule_matches() {
+        assert!(parse_anchor_rules_match(
+            "  block return out quick from any to <walden_blocked>\n"
+        ));
+    }
+
+    #[test]
+    fn changed_or_missing_anchor_rules_do_not_match() {
+        for output in [
+            "",
+            "pass out quick from any to <walden_blocked>",
+            "block return in quick from any to <walden_blocked>",
+            "block return out from any to <walden_blocked>",
+            "block return out quick from any to <another_table>",
+            "block return out quick proto tcp from any to <walden_blocked>",
+            "block return out quick from any to <walden_blocked>\npass out all",
+        ] {
+            assert!(
+                !parse_anchor_rules_match(output),
+                "unexpectedly accepted: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn unrestricted_parent_anchor_is_loaded() {
+        assert!(parse_parent_anchor_is_loaded(
+            "\n  anchor \"org.scotto.walden\"   all\n\
+             anchor \"another.anchor\" all\n"
+        ));
+    }
+
+    #[test]
+    fn missing_or_restricted_parent_anchor_is_not_loaded() {
+        for output in [
+            "",
+            "anchor \"another.anchor\" all",
+            "anchor \"org.scotto.walden\" in all",
+            "anchor \"org.scotto.walden\" out all",
+            "anchor \"org.scotto.walden\" on en0 all",
+            "anchor \"org.scotto.walden\" proto tcp all",
+        ] {
+            assert!(
+                !parse_parent_anchor_is_loaded(output),
+                "unexpectedly accepted: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parent_anchor_after_other_rules_is_not_loaded() {
+        for preceding_rule in [
+            "pass out quick all flags S/SA keep state",
+            "anchor \"another.anchor\" all",
+        ] {
+            let rules = format!("{preceding_rule}\nanchor \"{PF_ANCHOR}\" all\n");
+
+            assert!(
+                !parse_parent_anchor_is_loaded(&rules),
+                "unexpectedly accepted rules:\n{rules}"
+            );
+        }
+    }
+
+    #[test]
+    fn configuration_moves_anchor_before_filtering() {
+        let (anchor, load) = anchor_lines();
+
+        let conf = format!(
+            "set block-policy drop\n\
+             scrub-anchor \"com.apple/*\"\n\
+             nat-anchor \"com.apple/*\"\n\
+             rdr-anchor \"com.apple/*\"\n\
+             dummynet-anchor \"com.apple/*\"\n\
+             pass out quick all\n\
+             {anchor}\n\
+             {load}\n"
+        );
+
+        let expected = format!(
+            "set block-policy drop\n\
+             scrub-anchor \"com.apple/*\"\n\
+             nat-anchor \"com.apple/*\"\n\
+             rdr-anchor \"com.apple/*\"\n\
+             dummynet-anchor \"com.apple/*\"\n\
+             {anchor}\n\
+             pass out quick all\n\
+             {load}\n"
+        );
+
+        let updated = pf_conf_with_anchor(&conf);
+
+        assert_eq!(updated, expected);
+
+        // Repairing an already repaired configuration changes nothing.
+        assert_eq!(pf_conf_with_anchor(&updated), updated);
+    }
+
+    #[test]
+    fn an_empty_configuration_gets_the_anchor_pair() {
+        let (anchor, load) = anchor_lines();
+
+        assert_eq!(pf_conf_with_anchor(""), format!("{anchor}\n{load}\n"));
     }
 }

@@ -355,6 +355,116 @@ fn sets_match(resolved_addrs: &BTreeSet<ResolvedAddr>) -> anyhow::Result<bool> {
     Ok(active_v4 == expected_v4 && active_v6 == expected_v6)
 }
 
+fn blocking_rule_matches(rule: &Value, protocol: &str, set_name: &str) -> bool {
+    let Some(expr) = rule.get("expr").and_then(Value::as_array) else {
+        return false;
+    };
+
+    if expr.len() != 2 {
+        return false;
+    }
+
+    let expected_match = serde_json::json!({
+        "match": {
+            "op": "==",
+            "left": {
+                "payload": {
+                    "protocol": protocol,
+                    "field": "daddr"
+                }
+            },
+            "right": format!("@{set_name}")
+        }
+    });
+
+    let rejects = expr[1]
+        .as_object()
+        .is_some_and(|statement| statement.len() == 1 && statement.contains_key("reject"));
+
+    expr[0] == expected_match && rejects
+}
+
+fn parse_rules_match(output: &str) -> anyhow::Result<bool> {
+    let document: Value = serde_json::from_str(output).context("invalid nftables JSON output")?;
+    let objects = document
+        .get("nftables")
+        .and_then(Value::as_array)
+        .context("nftables JSON output has no object list")?;
+
+    let table = objects
+        .iter()
+        .filter_map(|object| object.get("table"))
+        .find(|table| {
+            table.get("family").and_then(Value::as_str) == Some(NFT_FAMILY)
+                && table.get("name").and_then(Value::as_str) == Some(NFT_TABLE)
+        });
+
+    let Some(table) = table else {
+        return Ok(false);
+    };
+
+    let table_is_active = match table.get("flags") {
+        None => true,
+        Some(Value::String(flag)) => flag != "dormant",
+        Some(Value::Array(flags)) => flags
+            .iter()
+            .all(|flag| flag.as_str().is_some_and(|name| name != "dormant")),
+
+        Some(_) => false,
+    };
+
+    if !table_is_active {
+        return Ok(false);
+    }
+
+    let chains = objects
+        .iter()
+        .filter_map(|object| object.get("chain"))
+        .find(|chain| {
+            chain.get("family").and_then(Value::as_str) == Some(NFT_FAMILY)
+                && chain.get("table").and_then(Value::as_str) == Some(NFT_TABLE)
+                && chain.get("name").and_then(Value::as_str) == Some("output")
+        });
+
+    let Some(chains) = chains else {
+        return Ok(false);
+    };
+
+    if Some("filter") != chains.get("type").and_then(Value::as_str)
+        || Some("output") != chains.get("hook").and_then(Value::as_str)
+        || chains.get("prio").and_then(Value::as_i64) != Some(0)
+        || chains.get("policy").and_then(Value::as_str) != Some("accept")
+    {
+        return Ok(false);
+    }
+
+    let rules = objects
+        .iter()
+        .filter_map(|object| object.get("rule"))
+        .filter(|rule| {
+            rule.get("family").and_then(Value::as_str) == Some(NFT_FAMILY)
+                && rule.get("table").and_then(Value::as_str) == Some(NFT_TABLE)
+                && rule.get("chain").and_then(Value::as_str) == Some("output")
+        })
+        .collect::<Vec<_>>();
+
+    if rules.len() != 2 {
+        return Ok(false);
+    }
+
+    Ok(blocking_rule_matches(rules[0], "ip", NFT_SET_V4)
+        && blocking_rule_matches(rules[1], "ip6", NFT_SET_V6))
+}
+
+fn rules_match() -> anyhow::Result<bool> {
+    let output = run_nft(
+        &["-j", "-n", "list", "table", "inet", "walden"],
+        "list table",
+    )?;
+
+    parse_rules_match(&output)
+}
+
 // Whether the block is still installed, read back from the running table: the
 // rules file it is loaded from, the table itself, the two rules that send
 // traffic at the sets, and addresses in those sets. Partial means something
@@ -365,14 +475,9 @@ pub fn status(resolved_addrs: &BTreeSet<ResolvedAddr>) -> ConfigStatus {
         return ConfigStatus::Absent;
     }
 
-    let Ok(ruleset) = run_nft(&["list", "table", NFT_FAMILY, NFT_TABLE], "list table") else {
-        return ConfigStatus::Absent;
-    };
-
-    let rules_present =
-        ruleset.contains(&format!("@{NFT_SET_V4}")) && ruleset.contains(&format!("@{NFT_SET_V6}"));
-    if !rules_present {
-        return ConfigStatus::Partial;
+    match rules_match() {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return ConfigStatus::Partial,
     }
 
     match sets_match(resolved_addrs) {
@@ -517,5 +622,195 @@ mod tests {
 
         let wrong_type = set_output(NFT_SET_V4, "ipv6_addr", "");
         assert!(parse_nft_set(&wrong_type, NFT_SET_V4, "ipv4_addr").is_err());
+    }
+
+    fn valid_rules_document() -> Value {
+        serde_json::json!({
+            "nftables": [
+                {
+                    "chain": {
+                        "family": "inet",
+                        "table": "walden",
+                        "name": "output",
+                        "type": "filter",
+                        "hook": "output",
+                        "prio": 0,
+                        "policy": "accept"
+                    }
+                },
+                {
+                    "rule": {
+                        "family": "inet",
+                        "table": "walden",
+                        "chain": "output",
+                        "expr": [
+                            {
+                                "match": {
+                                    "op": "==",
+                                    "left": {
+                                        "payload": {
+                                            "protocol": "ip",
+                                            "field": "daddr"
+                                        }
+                                    },
+                                    "right": "@walden_blocked_v4"
+                                }
+                            },
+                            {
+                                "reject": {
+                                    "type": "icmp",
+                                    "expr": "port-unreachable"
+                                }
+                            }
+                        ]
+                    }
+                },
+                {
+                    "rule": {
+                        "family": "inet",
+                        "table": "walden",
+                        "chain": "output",
+                        "expr": [
+                            {
+                                "match": {
+                                    "op": "==",
+                                    "left": {
+                                        "payload": {
+                                            "protocol": "ip6",
+                                            "field": "daddr"
+                                        }
+                                    },
+                                    "right": "@walden_blocked_v6"
+                                }
+                            },
+                            {
+                                "reject": {
+                                    "type": "icmpv6",
+                                    "expr": "port-unreachable"
+                                }
+                            }
+                        ]
+                    }
+                },
+                {
+                    "table": {
+                        "family": "inet",
+                        "name": "walden"
+                    }
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn expected_blocking_rules_match() {
+        let document = valid_rules_document();
+
+        assert!(parse_rules_match(&document.to_string()).unwrap());
+    }
+
+    #[test]
+    fn rules_attached_to_the_wrong_hook_do_not_match() {
+        let mut document = valid_rules_document();
+        document["nftables"][0]["chain"]["hook"] = serde_json::json!("input");
+
+        assert!(!parse_rules_match(&document.to_string()).unwrap());
+    }
+
+    #[test]
+    fn a_missing_blocking_rule_does_not_match() {
+        let mut document = valid_rules_document();
+        document["nftables"].as_array_mut().unwrap().remove(2);
+
+        assert!(!parse_rules_match(&document.to_string()).unwrap());
+    }
+
+    #[test]
+    fn accepting_instead_of_rejecting_does_not_match() {
+        let mut document = valid_rules_document();
+        document["nftables"][1]["rule"]["expr"][1] = serde_json::json!({ "accept": null });
+
+        assert!(!parse_rules_match(&document.to_string()).unwrap());
+    }
+
+    #[test]
+    fn an_earlier_accept_rule_does_not_match() {
+        let mut document = valid_rules_document();
+        let accept_rule = serde_json::json!({
+            "rule": {
+                "family": "inet",
+                "table": "walden",
+                "chain": "output",
+                "expr": [{ "accept": null }]
+            }
+        });
+
+        document["nftables"]
+            .as_array_mut()
+            .unwrap()
+            .insert(1, accept_rule);
+
+        assert!(!parse_rules_match(&document.to_string()).unwrap());
+    }
+
+    #[test]
+    fn a_rule_using_the_wrong_set_does_not_match() {
+        let mut document = valid_rules_document();
+        document["nftables"][1]["rule"]["expr"][0]["match"]["right"] =
+            serde_json::json!("@another_set");
+
+        assert!(!parse_rules_match(&document.to_string()).unwrap());
+    }
+
+    #[test]
+    fn an_extra_condition_does_not_match() {
+        let mut document = valid_rules_document();
+        let port_condition = serde_json::json!({
+            "match": {
+                "op": "==",
+                "left": {
+                    "payload": {
+                        "protocol": "tcp",
+                        "field": "dport"
+                    }
+                },
+                "right": 443
+            }
+        });
+
+        document["nftables"][1]["rule"]["expr"]
+            .as_array_mut()
+            .unwrap()
+            .insert(1, port_condition);
+
+        assert!(!parse_rules_match(&document.to_string()).unwrap());
+    }
+
+    #[test]
+    fn invalid_rules_output_returns_an_error() {
+        assert!(parse_rules_match("not JSON").is_err());
+        assert!(parse_rules_match(r#"{"nftables": {}}"#).is_err());
+    }
+
+    #[test]
+    fn a_dormant_table_does_not_match() {
+        for flags in [
+            serde_json::json!("dormant"),
+            serde_json::json!(["dormant"]),
+            serde_json::json!(["owner", "dormant"]),
+        ] {
+            let mut document = valid_rules_document();
+            document["nftables"][3]["table"]["flags"] = flags;
+
+            assert!(!parse_rules_match(&document.to_string()).unwrap());
+        }
+    }
+
+    #[test]
+    fn a_missing_table_does_not_match() {
+        let mut document = valid_rules_document();
+        document["nftables"].as_array_mut().unwrap().pop();
+
+        assert!(!parse_rules_match(&document.to_string()).unwrap());
     }
 }
