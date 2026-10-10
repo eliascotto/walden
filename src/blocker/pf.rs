@@ -45,8 +45,14 @@ fn to_table_entry(addr: &ResolvedAddr) -> String {
 }
 
 fn run_pfctl_output(args: &[&str], what: &str) -> anyhow::Result<std::process::Output> {
-    let output = Command::new("pfctl")
-        .args(args)
+    run_pfctl_output_with(Command::new("pfctl").args(args), what)
+}
+
+fn run_pfctl_output_with(
+    command: &mut Command,
+    what: &str,
+) -> anyhow::Result<std::process::Output> {
+    let output = command
         .output()
         .with_context(|| format!("failed to run pfctl: {what}"))?;
 
@@ -441,13 +447,28 @@ pub fn status(resolved_addrs: &BTreeSet<ResolvedAddr>) -> ConfigStatus {
 // this asks nothing about the block list, so it can be answered before one is
 // known -- at startup, when the daemon has to tell an interrupted teardown
 // from a clean machine.
-pub fn has_leftovers() -> bool {
-    let conf_wired = matches!(
-        pf_conf_has_anchor(),
-        Ok(ConfigStatus::Present | ConfigStatus::Partial)
-    );
+pub fn has_leftovers() -> anyhow::Result<bool> {
+    if !matches!(pf_conf_has_anchor()?, ConfigStatus::Absent) {
+        return Ok(true);
+    }
 
-    conf_wired || Path::new(PF_ANCHOR_FILE).exists() || current_token().is_some()
+    for file in [PF_ANCHOR_FILE, PF_TABLE_FILE, PF_TOKEN_FILE] {
+        if Path::new(file)
+            .try_exists()
+            .with_context(|| format!("failed to inspect {file}"))?
+        {
+            return Ok(true);
+        }
+    }
+
+    loaded_anchor_exists_with(Command::new("pfctl").args(["-s", "Anchors"]))
+}
+
+fn loaded_anchor_exists_with(command: &mut Command) -> anyhow::Result<bool> {
+    let output = run_pfctl_output_with(command, "list anchors")?;
+    let anchors = std::str::from_utf8(&output.stdout).context("invalid PF anchor-list encoding")?;
+
+    Ok(anchors.lines().any(|line| line.trim() == PF_ANCHOR))
 }
 
 // Applies the blocking state, repairing it if it has drifted. The block list is
@@ -476,6 +497,19 @@ pub fn unblock() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn query_command(stdout: &str, stderr: &str, exit_code: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf '%s' \"$1\"; printf '%s' \"$2\" >&2; exit \"$3\"",
+            "firewall-query-test",
+            stdout,
+            stderr,
+            exit_code,
+        ]);
+        command
+    }
 
     #[test]
     fn parses_and_normalizes_pf_table_entries() {
@@ -623,5 +657,36 @@ mod tests {
         let (anchor, load) = anchor_lines();
 
         assert_eq!(pf_conf_with_anchor(""), format!("{anchor}\n{load}\n"));
+    }
+
+    #[test]
+    fn loaded_anchor_query_distinguishes_presence_from_absence() {
+        for (output, expected) in [
+            ("", false),
+            ("  com.apple\n", false),
+            ("  org.scotto.walden-other\n", false),
+            ("  com.apple\n  org.scotto.walden\n", true),
+        ] {
+            assert_eq!(
+                loaded_anchor_exists_with(&mut query_command(output, "", "0")).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn failed_loaded_anchor_queries_are_errors() {
+        assert!(
+            loaded_anchor_exists_with(&mut query_command("", "Permission denied", "1",)).is_err()
+        );
+
+        assert!(loaded_anchor_exists_with(&mut Command::new("/dev/null/walden-pf-test")).is_err());
+    }
+
+    #[test]
+    fn anchor_query_checks_stdout_only() {
+        assert!(
+            !loaded_anchor_exists_with(&mut query_command("", "org.scotto.walden", "0",)).unwrap()
+        );
     }
 }

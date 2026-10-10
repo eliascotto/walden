@@ -59,9 +59,9 @@ pub fn leftovers_present() -> Result<bool, anyhow::Error> {
     let hosts_leftovers = hosts::has_section()?;
 
     let firewall_leftovers = if IS_MACOS {
-        pf::has_leftovers()
+        pf::has_leftovers()?
     } else if IS_LINUX {
-        nft::has_leftovers()
+        nft::has_leftovers()?
     } else {
         return Err(anyhow::anyhow!("Unsupported platform"));
     };

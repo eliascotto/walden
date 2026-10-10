@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::net::IpAddr;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use crate::blocker::common::{
     AddressRange, ConfigStatus, normalize_address_ranges, resolved_address_ranges,
@@ -118,14 +118,52 @@ fn run_nft(args: &[&str], what: &str) -> anyhow::Result<String> {
     Ok(format!("{stdout}{stderr}"))
 }
 
-fn table_exists() -> bool {
-    Command::new("nft")
-        .args(["list", "table", NFT_FAMILY, NFT_TABLE])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+fn table_exists() -> anyhow::Result<bool> {
+    table_exists_with(Command::new("nft").args(["-j", "list", "tables"]))
+}
+
+fn table_exists_with(command: &mut Command) -> anyhow::Result<bool> {
+    let output = command.output().context("failed to list nftables tables")?;
+
+    anyhow::ensure!(
+        output.status.success(),
+        "nft list tables failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+
+    let document: Value =
+        serde_json::from_slice(&output.stdout).context("invalid nftables table-list JSON")?;
+
+    let entries = document
+        .get("nftables")
+        .and_then(Value::as_array)
+        .context("nftables table list has no nftables array")?;
+
+    let mut found = false;
+
+    for entry in entries {
+        if entry.get("metainfo").is_some() {
+            continue;
+        }
+
+        let table = entry
+            .get("table")
+            .context("unexpected entry in nftables table list")?;
+
+        let family = table
+            .get("family")
+            .and_then(Value::as_str)
+            .context("nftables table has no family")?;
+
+        let name = table
+            .get("name")
+            .and_then(Value::as_str)
+            .context("nftables table has no name")?;
+
+        found |= family == NFT_FAMILY && name == NFT_TABLE;
+    }
+
+    Ok(found)
 }
 
 // Adds an include line to the system nftables config so the table comes back on
@@ -195,11 +233,18 @@ fn ensure_ruleset_loaded(v4: &[String], v6: &[String]) -> anyhow::Result<()> {
 // Drops the whole table -- sets, chain, rules and addresses go with it -- and
 // removes the file it was loaded from.
 fn delete_table() -> anyhow::Result<()> {
-    if table_exists() {
+    delete_table_with(NFT_RULES_FILE, table_exists)
+}
+
+fn delete_table_with(
+    rules_file: &str,
+    query_table: impl FnOnce() -> anyhow::Result<bool>,
+) -> anyhow::Result<()> {
+    if query_table()? {
         run_nft(&["delete", "table", NFT_FAMILY, NFT_TABLE], "delete table")?;
     }
 
-    common::remove_file_if_present(NFT_RULES_FILE)?;
+    common::remove_file_if_present(rules_file)?;
     Ok(())
 }
 
@@ -491,8 +536,12 @@ pub fn status(resolved_addrs: &BTreeSet<ResolvedAddr>) -> ConfigStatus {
 // this asks nothing about the block list, so it can be answered before one is
 // known -- at startup, when the daemon has to tell an interrupted teardown
 // from a clean machine.
-pub fn has_leftovers() -> bool {
-    Path::new(NFT_RULES_FILE).exists() || table_exists()
+pub fn has_leftovers() -> anyhow::Result<bool> {
+    let rules_file_exists = Path::new(NFT_RULES_FILE)
+        .try_exists()
+        .with_context(|| format!("failed to inspect {NFT_RULES_FILE}"))?;
+
+    Ok(rules_file_exists || table_exists()?)
 }
 
 // Applies the blocking state, repairing it if it has drifted. The block list is
@@ -516,6 +565,19 @@ pub fn unblock() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn query_command(stdout: &str, stderr: &str, exit_code: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf '%s' \"$1\"; printf '%s' \"$2\" >&2; exit \"$3\"",
+            "firewall-query-test",
+            stdout,
+            stderr,
+            exit_code,
+        ]);
+        command
+    }
 
     fn set_output(name: &str, address_type: &str, elements: &str) -> String {
         format!(
@@ -812,5 +874,98 @@ mod tests {
         document["nftables"].as_array_mut().unwrap().pop();
 
         assert!(!parse_rules_match(&document.to_string()).unwrap());
+    }
+
+    #[test]
+    fn table_query_distinguishes_presence_from_absence() {
+        for (output, expected) in [
+            (r#"{"nftables":[]}"#, false),
+            (
+                r#"{"nftables":[{"metainfo":{"json_schema_version":1}}]}"#,
+                false,
+            ),
+            (
+                r#"{"nftables":[{"table":{"family":"inet","name":"walden"}}]}"#,
+                true,
+            ),
+            (
+                r#"{"nftables":[{"table":{"family":"ip","name":"walden"}}]}"#,
+                false,
+            ),
+            (
+                r#"{"nftables":[{"table":{"family":"inet","name":"other"}}]}"#,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                table_exists_with(&mut query_command(output, "", "0")).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn failed_table_queries_are_errors_even_with_valid_empty_output() {
+        let error = table_exists_with(&mut query_command(
+            r#"{"nftables":[]}"#,
+            "Operation not permitted",
+            "1",
+        ))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Operation not permitted"));
+
+        assert!(table_exists_with(&mut Command::new("/dev/null/walden-nft-test")).is_err());
+    }
+
+    #[test]
+    fn malformed_table_lists_are_errors() {
+        for output in [
+            "",
+            "not JSON",
+            "{}",
+            r#"{"nftables":{}}"#,
+            r#"{"nftables":[{"table":{"name":"walden"}}]}"#,
+            r#"{"nftables":[{"table":{"family":"inet","name":null}}]}"#,
+        ] {
+            assert!(
+                table_exists_with(&mut query_command(output, "", "0")).is_err(),
+                "accepted malformed output: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn successful_table_query_keeps_diagnostics_out_of_json() {
+        assert!(
+            !table_exists_with(&mut query_command(
+                r#"{"nftables":[]}"#,
+                "informational diagnostic",
+                "0",
+            ))
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn failed_table_query_preserves_the_rules_file() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let rules_file =
+            std::env::temp_dir().join(format!("walden-nft-query-{}-{unique}", std::process::id()));
+        fs::write(&rules_file, "saved rules").unwrap();
+
+        let result = delete_table_with(rules_file.to_str().unwrap(), || {
+            table_exists_with(&mut query_command("", "Operation not permitted", "1"))
+        });
+
+        let contents = fs::read_to_string(&rules_file).unwrap();
+        fs::remove_file(&rules_file).unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(contents, "saved rules");
     }
 }

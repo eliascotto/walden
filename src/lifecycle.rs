@@ -1318,4 +1318,53 @@ mod tests {
         assert!(!lifecycle.complete_teardown());
         assert_eq!(RETIREMENTS.load(Ordering::SeqCst), 2);
     }
+
+    #[test]
+    fn failed_cleanup_verification_preserves_retirement_until_retry_succeeds() {
+        static QUERIES: AtomicUsize = AtomicUsize::new(0);
+        static RETIREMENTS: AtomicUsize = AtomicUsize::new(0);
+
+        fn verify() -> anyhow::Result<bool> {
+            if QUERIES.fetch_add(1, Ordering::SeqCst) == 0 {
+                bail!("injected firewall query failure");
+            }
+            Ok(false)
+        }
+
+        fn retire() -> anyhow::Result<()> {
+            RETIREMENTS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        QUERIES.store(0, Ordering::SeqCst);
+        RETIREMENTS.store(0, Ordering::SeqCst);
+
+        let mut settings = running_settings();
+        settings.block_is_running = false;
+        settings.block_end_at = Some(Utc::now());
+        let retirement_marker = settings.block_end_at;
+
+        let lifecycle = lifecycle_with_teardown(
+            PersistedSettings::Valid(settings),
+            save_ok,
+            apply_ok,
+            Teardown {
+                stop_blocking: unblock_ok,
+                leftovers_present: verify,
+                retire_daemon: retire,
+            },
+        );
+
+        lifecycle.resume();
+
+        assert!(lifecycle.state().retiring);
+        assert!(!lifecycle.complete_teardown());
+        assert_eq!(RETIREMENTS.load(Ordering::SeqCst), 0);
+        assert_eq!(lifecycle.status().block_end_at, retirement_marker);
+
+        assert!(lifecycle.complete_teardown());
+        assert_eq!(QUERIES.load(Ordering::SeqCst), 2);
+        assert_eq!(RETIREMENTS.load(Ordering::SeqCst), 1);
+        assert_eq!(lifecycle.status().block_end_at, None);
+    }
 }
