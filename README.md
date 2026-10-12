@@ -2,6 +2,8 @@
 
 A destkop CLI tool to hard block websites that are known to be harmful or addictive. Created to help users be more productive and prevent brain rot. Works on MacOS and Linux.
 
+![Made with VHS](https://vhs.charm.sh/vhs-18HDdXQWhlf2ed4xRlSi9M.gif)
+
 The term “brain rot” first appeared in English in *Walden*, by [Henry David Thoreau](https://en.wikipedia.org/wiki/Henry_David_Thoreau).
 
 > While England endeavours to cure the potato rot, will not any endeavour to cure the brain-rot – which prevails so much more widely and fatally?
