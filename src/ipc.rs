@@ -155,7 +155,7 @@ where
                     break;
                 };
                 if let Err(err) = serve_client(handler.as_ref(), stream) {
-                    eprintln!("walden: failed to handle a client: {err:#}");
+                    crate::daemon_log!("walden: failed to handle a client: {err:#}");
                 }
             }
         }));
@@ -412,16 +412,25 @@ mod tests {
     #[test]
     fn a_frame_at_the_size_limit_round_trips() {
         let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        // This checks the byte boundary, not debug-build throughput. Other
+        // large-frame tests can contend for CPU; deadline behavior has its own
+        // slow-drip tests. Production clients keep their five-second deadline.
+        let boundary_test_timeout = Duration::from_secs(30);
+        reader
+            .set_read_timeout(Some(boundary_test_timeout))
+            .unwrap();
         let value = "x".repeat(MAX_FRAME_BYTES - 2); // JSON string quotes count too.
         let sender = thread::spawn(move || {
-            writer.set_write_timeout(Some(CLIENT_TIMEOUT)).unwrap();
+            writer
+                .set_write_timeout(Some(boundary_test_timeout))
+                .unwrap();
             send_json(&mut writer, &value).unwrap();
         });
 
         let received: String = receive_json(&mut reader).unwrap();
         assert_eq!(received.len(), MAX_FRAME_BYTES - 2);
         assert!(received.bytes().all(|byte| byte == b'x'));
-        assert_eq!(reader.read_timeout().unwrap(), None);
+        assert_eq!(reader.read_timeout().unwrap(), Some(boundary_test_timeout));
         sender.join().unwrap();
     }
 

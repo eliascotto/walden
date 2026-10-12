@@ -536,11 +536,22 @@ pub fn status(resolved_addrs: &BTreeSet<ResolvedAddr>) -> ConfigStatus {
 // known -- at startup, when the daemon has to tell an interrupted teardown
 // from a clean machine.
 pub fn has_leftovers() -> anyhow::Result<bool> {
+    Ok(!cleanup_leftovers()?.is_empty())
+}
+
+pub fn cleanup_leftovers() -> anyhow::Result<Vec<String>> {
+    let mut remaining = Vec::new();
     let rules_file_exists = Path::new(NFT_RULES_FILE)
         .try_exists()
         .with_context(|| format!("failed to inspect {NFT_RULES_FILE}"))?;
 
-    Ok(rules_file_exists || table_exists()?)
+    if rules_file_exists {
+        remaining.push(NFT_RULES_FILE.into());
+    }
+    if table_exists()? {
+        remaining.push("nftables table inet walden".into());
+    }
+    Ok(remaining)
 }
 
 // Applies the blocking state, repairing it if it has drifted. The block list is

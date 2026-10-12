@@ -21,8 +21,11 @@ const TICK: Duration = Duration::from_secs(1);
 const INTEGRITY_INTERVAL: Duration = Duration::from_secs(15);
 const RESOLUTION_TTL: Duration = Duration::from_secs(15 * 60);
 
-type ResolveAll =
-    fn(&[String], &mut dyn FnMut(resolver::ResolveProgress) -> bool) -> BTreeSet<ResolvedAddr>;
+type ResolveAll = fn(
+    &[String],
+    &mut resolver::ResolutionCache,
+    &mut dyn FnMut(resolver::ResolveProgress) -> bool,
+) -> BTreeSet<ResolvedAddr>;
 
 fn unlock_delay(secs: u64) -> Option<TimeDelta> {
     TimeDelta::try_seconds(i64::try_from(secs).ok()?)
@@ -43,9 +46,29 @@ struct State {
     apply_generation: u64,
     apply_progress: Option<protocol::ApplyProgress>,
     retiring: bool,
+    cleanup: Option<protocol::CleanupProgress>,
+    dns_cache: resolver::ResolutionCache,
+    candidate: Option<DnsCandidate>,
+    last_apply_failure: Option<protocol::ApplyFailure>,
+    apply_attempts: u64,
+    apply_retry_at: Option<chrono::DateTime<Utc>>,
+    apply_retry_delay_secs: u64,
+}
+
+#[derive(Clone)]
+struct DnsCandidate {
+    addresses: BTreeSet<ResolvedAddr>,
+    progress: protocol::ApplyProgress,
+    expires: Instant,
 }
 
 impl State {
+    fn begin_cleanup(&mut self) {
+        self.retiring = true;
+        self.cleanup
+            .get_or_insert_with(protocol::CleanupProgress::new);
+    }
+
     fn valid_settings(&self) -> Option<&Settings> {
         match &self.settings {
             PersistedSettings::Valid(settings) => Some(settings),
@@ -112,7 +135,12 @@ impl State {
         self.persist_replacement(settings)?;
         self.apply_generation = self.apply_generation.wrapping_add(1);
         self.apply_progress = None;
-        self.retiring = true;
+        self.candidate = None;
+        self.dns_cache = resolver::ResolutionCache::default();
+        self.last_apply_failure = None;
+        self.apply_retry_at = None;
+        self.apply_retry_delay_secs = 5;
+        self.begin_cleanup();
         Ok(())
     }
 }
@@ -120,13 +148,13 @@ impl State {
 #[derive(Clone, Copy)]
 struct Teardown {
     stop_blocking: fn() -> anyhow::Result<()>,
-    leftovers_present: fn() -> anyhow::Result<bool>,
+    leftovers_present: fn() -> anyhow::Result<Vec<String>>,
     retire_daemon: fn() -> anyhow::Result<()>,
 }
 
 const SYSTEM_TEARDOWN: Teardown = Teardown {
     stop_blocking: blocker::stop_blocking,
-    leftovers_present: blocker::leftovers_present,
+    leftovers_present: blocker::cleanup_leftovers,
     retire_daemon: service::retire_daemon,
 };
 
@@ -135,6 +163,7 @@ pub struct Lifecycle {
     state: Arc<Mutex<State>>,
     apply_hosts: fn(&[String]) -> anyhow::Result<()>,
     apply_block: fn(&[String], &BTreeSet<ResolvedAddr>) -> anyhow::Result<()>,
+    prepare_firewall: fn() -> anyhow::Result<()>,
     resolve_all: ResolveAll,
     teardown: Teardown,
     apply_in_progress: Arc<AtomicBool>,
@@ -148,7 +177,9 @@ impl Lifecycle {
             Ok(None) => PersistedSettings::Missing,
             Err(err) => {
                 let reason = format!("{err:#}");
-                eprintln!("walden: persisted settings are invalid; the daemon is locked: {reason}");
+                crate::daemon_log!(
+                    "walden: persisted settings are invalid; the daemon is locked: {reason}"
+                );
                 PersistedSettings::Invalid(reason)
             }
         };
@@ -162,10 +193,18 @@ impl Lifecycle {
                 apply_generation: 0,
                 apply_progress: None,
                 retiring: false,
+                cleanup: None,
+                dns_cache: resolver::ResolutionCache::default(),
+                candidate: None,
+                apply_retry_delay_secs: 5,
+                last_apply_failure: None,
+                apply_attempts: 0,
+                apply_retry_at: None,
             })),
             apply_hosts: blocker::hosts::block,
             apply_block: blocker::apply,
-            resolve_all: resolver::resolve_all_with_progress,
+            prepare_firewall: blocker::prepare,
+            resolve_all: resolver::resolve_cached,
             teardown: SYSTEM_TEARDOWN,
             apply_in_progress: Arc::new(AtomicBool::new(false)),
             apply_requested: Arc::new(AtomicBool::new(false)),
@@ -231,6 +270,15 @@ impl Lifecycle {
             (state.apply_generation, block_list, already_applied)
         };
 
+        {
+            let mut state = self.state();
+            if state.apply_generation != generation {
+                return;
+            }
+            state.apply_attempts = state.apply_attempts.saturating_add(1);
+            state.apply_retry_at = None;
+        }
+
         if !self.set_apply_progress(
             generation,
             protocol::ApplyProgress {
@@ -252,20 +300,80 @@ impl Lifecycle {
             return;
         }
 
-        let mut failed_lookups = 0;
-        let resolved = (self.resolve_all)(&block_list, &mut |progress| {
-            failed_lookups = progress.failed_lookups;
-            self.set_apply_progress(
+        if !already_applied {
+            if !self.set_apply_progress(
                 generation,
                 protocol::ApplyProgress {
-                    stage: protocol::ApplyStage::Resolving,
-                    completed: progress.completed,
-                    total: progress.total,
-                    resolved_addresses: progress.resolved_addresses,
-                    failed_lookups: progress.failed_lookups,
+                    stage: protocol::ApplyStage::PreparingFirewall,
+                    completed: 0,
+                    total: block_list.len(),
+                    resolved_addresses: 0,
+                    failed_lookups: 0,
                 },
-            )
-        });
+            ) {
+                return;
+            }
+            if let Err(err) = (self.prepare_firewall)() {
+                self.record_apply_error(generation, already_applied, &err);
+                return;
+            }
+        }
+
+        let candidate = if already_applied {
+            None
+        } else {
+            self.state()
+                .candidate
+                .clone()
+                .filter(|candidate| candidate.expires > Instant::now())
+        };
+
+        let mut failed_lookups = 0;
+        let resolved = if let Some(candidate) = candidate {
+            failed_lookups = candidate.progress.failed_lookups;
+            let mut progress = candidate.progress;
+            progress.stage = protocol::ApplyStage::PreparingFirewall;
+            if !self.set_apply_progress(generation, progress) {
+                return;
+            }
+            candidate.addresses
+        } else {
+            let mut cache = std::mem::take(&mut self.state().dns_cache);
+            let resolved = (self.resolve_all)(&block_list, &mut cache, &mut |progress| {
+                failed_lookups = progress.failed_lookups;
+                self.set_apply_progress(
+                    generation,
+                    protocol::ApplyProgress {
+                        stage: protocol::ApplyStage::Resolving,
+                        completed: progress.completed,
+                        total: progress.total,
+                        resolved_addresses: progress.resolved_addresses,
+                        failed_lookups: progress.failed_lookups,
+                    },
+                )
+            });
+            let mut state = self.state();
+            if state.apply_generation != generation {
+                return;
+            }
+            let expires = cache.next_refresh().unwrap_or(
+                Instant::now()
+                    + if failed_lookups > 0 {
+                        Duration::from_secs(30)
+                    } else {
+                        RESOLUTION_TTL
+                    },
+            );
+            state.dns_cache = cache;
+            if let Some(progress) = state.apply_progress.clone() {
+                state.candidate = Some(DnsCandidate {
+                    addresses: resolved.clone(),
+                    progress,
+                    expires,
+                });
+            }
+            resolved
+        };
         if self.generation_cancelled(generation) {
             return;
         }
@@ -279,7 +387,7 @@ impl Lifecycle {
                 // Keep working coverage while adding any new DNS answers.
                 // Leave the cache stale so the next integrity check retries DNS.
                 state.resolved_at = None;
-                eprintln!(
+                crate::daemon_log!(
                     "walden: DNS refresh failed for {failed_lookups} hostnames; keeping previous firewall coverage and retrying at the next integrity check"
                 );
                 let Some(mut retained) = state.resolved.clone() else {
@@ -295,16 +403,20 @@ impl Lifecycle {
             }
         };
 
-        if !self.set_apply_progress(
-            generation,
-            protocol::ApplyProgress {
-                stage: protocol::ApplyStage::InstallingFirewall,
-                completed: resolved.len(),
-                total: resolved.len(),
-                resolved_addresses: resolved.len(),
+        let mut progress = self
+            .state()
+            .apply_progress
+            .clone()
+            .unwrap_or(protocol::ApplyProgress {
+                stage: protocol::ApplyStage::Resolving,
+                completed: 0,
+                total: 0,
+                resolved_addresses: 0,
                 failed_lookups,
-            },
-        ) {
+            });
+        progress.stage = protocol::ApplyStage::InstallingFirewall;
+        progress.resolved_addresses = resolved.len();
+        if !self.set_apply_progress(generation, progress) {
             return;
         }
 
@@ -331,11 +443,7 @@ impl Lifecycle {
     }
 
     fn record_apply_error(&self, generation: u64, already_applied: bool, err: &anyhow::Error) {
-        eprintln!("walden: failed to apply blocking rules: {err:#}");
-        if already_applied {
-            return;
-        }
-
+        crate::daemon_log!("walden: failed to apply blocking rules: {err:#}");
         let mut state = self.state();
         if state.apply_generation != generation {
             return;
@@ -346,9 +454,29 @@ impl Lifecycle {
         if !settings.block_is_running {
             return;
         }
+        let requires_action = blocker::requires_action(err);
+        state.last_apply_failure = Some(protocol::ApplyFailure {
+            stage: state
+                .apply_progress
+                .as_ref()
+                .map_or(protocol::ApplyStage::WritingHosts, |progress| {
+                    progress.stage
+                }),
+            message: format!("{err:#}"),
+            failed_at: Utc::now(),
+            attempt: state.apply_attempts,
+            requires_action,
+        });
+        let retry_delay = state.apply_retry_delay_secs;
+        state.apply_retry_at =
+            (!requires_action).then(|| Utc::now() + TimeDelta::seconds(retry_delay as i64));
+        state.apply_retry_delay_secs = retry_delay.saturating_mul(2).min(300);
+        if already_applied {
+            return;
+        }
         settings.apply_error = Some(format!("{err:#}"));
         if let Err(persist_err) = state.persist_replacement(settings) {
-            eprintln!("walden: failed to record the apply error: {persist_err:#}");
+            crate::daemon_log!("walden: failed to record the apply error: {persist_err:#}");
         }
     }
 
@@ -363,12 +491,26 @@ impl Lifecycle {
         if !settings.block_is_running {
             return;
         }
+        let already_applied = settings.rules_applied;
+        if let Some(progress) = &mut state.apply_progress {
+            progress.stage = protocol::ApplyStage::SavingState;
+        }
         settings.rules_applied = true;
         settings.apply_error = None;
-        if let Err(err) = state.persist_replacement(settings) {
-            eprintln!("walden: failed to record that rules were applied: {err:#}");
-        } else {
+        let saved = state.persist_replacement(settings);
+        if saved.is_ok() {
             state.apply_progress = None;
+            state.last_apply_failure = None;
+            state.apply_retry_at = None;
+            state.apply_retry_delay_secs = 5;
+        }
+        drop(state);
+        if let Err(err) = saved {
+            self.record_apply_error(
+                generation,
+                already_applied,
+                &err.context("failed to durably record activation"),
+            );
         }
     }
 
@@ -376,7 +518,7 @@ impl Lifecycle {
         let state = self.state();
 
         if let Some(reason) = state.invalid_settings_reason() {
-            eprintln!(
+            crate::daemon_log!(
                 "walden: cannot trust the persisted block state; leaving any installed rules in place: {reason}"
             );
             return;
@@ -406,15 +548,23 @@ impl Lifecycle {
         // re-applying rules. An inactive block may have interrupted cleanup.
         if is_inactive {
             if pending_retirement {
-                self.state().retiring = true;
+                self.state().begin_cleanup();
                 return;
             }
             match (self.teardown.leftovers_present)() {
-                Ok(false) => {}
-                Ok(true) => self.state().retiring = true,
+                Ok(remaining) if remaining.is_empty() => {}
+                Ok(remaining) => {
+                    let mut state = self.state();
+                    state.begin_cleanup();
+                    state.cleanup.as_mut().unwrap().remaining = remaining;
+                }
                 Err(err) => {
-                    eprintln!("walden: could not verify cleanup: {err:#}");
-                    self.state().retiring = true;
+                    self.state().begin_cleanup();
+                    self.cleanup_failed(
+                        protocol::CleanupStage::VerifyingRules,
+                        format!("{err:#}"),
+                        Vec::new(),
+                    );
                 }
             }
             return;
@@ -424,12 +574,20 @@ impl Lifecycle {
             return;
         }
 
-        // No settings: leave installed rules alone; we cannot know what they were for.
-        if blocker::leftovers_present().unwrap_or(false) {
-            eprintln!(
-                "walden: block rules are installed but the settings file is missing, leaving them in place"
-            );
-        }
+        // No settings: preserve orphaned rules rather than silently declaring
+        // an unblocked machine or allowing a new block to overwrite them.
+        let reason = match (self.teardown.leftovers_present)() {
+            Ok(remaining) if remaining.is_empty() => return,
+            Ok(remaining) => format!(
+                "saved block state is missing, but rules or runtime files remain: {}",
+                remaining.join(", ")
+            ),
+            Err(err) => {
+                format!("saved block state is missing and rule cleanup cannot be verified: {err:#}")
+            }
+        };
+        crate::daemon_log!("walden: {reason}; leaving existing rules in place");
+        self.state().settings = PersistedSettings::Invalid(reason);
     }
 
     pub fn start(
@@ -454,7 +612,18 @@ impl Lifecycle {
         }
 
         if state.retiring {
-            bail!("the previous block is still being cleaned up; retry start shortly");
+            let detail = state
+                .cleanup
+                .as_ref()
+                .and_then(|cleanup| cleanup.error.as_deref());
+            if detail.is_some() {
+                bail!(
+                    "previous block cleanup failed; run `walden status --verbose` for recovery details"
+                );
+            }
+            bail!(
+                "the previous block is still being cleaned up; run `walden status` to check progress"
+            );
         }
 
         if let Some(settings) = state.valid_settings()
@@ -467,6 +636,11 @@ impl Lifecycle {
             let same_operation = settings.operation_id.as_deref() == Some(&operation_id);
             if !same_operation {
                 if !settings.rules_applied {
+                    if settings.apply_error.is_some() {
+                        bail!(
+                            "the pending start has failed; check `walden status --verbose`, then cancel it with `walden stop` before starting again"
+                        );
+                    }
                     bail!("a different block is still being applied");
                 }
                 bail!("a different block is already running");
@@ -477,7 +651,9 @@ impl Lifecycle {
                 bail!("the start operation ID was reused with different block settings");
             }
 
-            let retry_failed_apply = !settings.rules_applied && settings.apply_error.is_some();
+            let retry_failed_apply = !settings.rules_applied
+                && settings.apply_error.is_some()
+                && Self::retry_ready(&state);
             drop(state);
             if retry_failed_apply {
                 self.spawn_apply();
@@ -507,6 +683,12 @@ impl Lifecycle {
         state.resolved = None;
         state.resolved_at = None;
         state.apply_progress = Some(initial_progress);
+        state.dns_cache = resolver::ResolutionCache::default();
+        state.candidate = None;
+        state.last_apply_failure = None;
+        state.apply_attempts = 0;
+        state.apply_retry_at = None;
+        state.apply_retry_delay_secs = 5;
         drop(state);
 
         self.spawn_apply();
@@ -521,6 +703,10 @@ impl Lifecycle {
 
         if let Some(reason) = state.invalid_settings_reason() {
             bail!("persisted settings are invalid; refusing to change locked state: {reason}");
+        }
+
+        if state.retiring {
+            return Ok(protocol::StopOutcome::CleanupPending);
         }
 
         let (is_running, rules_applied, unlock_delay_secs, block_end_at) =
@@ -561,7 +747,7 @@ impl Lifecycle {
 
                 None => {
                     // Route through normal teardown rather than a special case.
-                    eprintln!("walden: no unlock delay was recorded; ending immediately");
+                    crate::daemon_log!("walden: no unlock delay was recorded; ending immediately");
                     Utc::now()
                 }
             }
@@ -581,9 +767,9 @@ impl Lifecycle {
         if apply_cancelled {
             state.apply_generation = state.apply_generation.wrapping_add(1);
             state.apply_progress = None;
-            eprintln!("walden: apply cancelled before the block was locked in");
+            crate::daemon_log!("walden: apply cancelled before the block was locked in");
         }
-        eprintln!("walden: the block will end at {block_end_at}");
+        crate::daemon_log!("walden: the block will end at {block_end_at}");
         if apply_cancelled {
             Ok(protocol::StopOutcome::ApplyCancelled)
         } else {
@@ -594,7 +780,7 @@ impl Lifecycle {
     pub fn status(&self) -> protocol::StatusResponse {
         let state = self.state();
 
-        match &state.settings {
+        let mut status = match &state.settings {
             PersistedSettings::Valid(settings) => protocol::StatusResponse {
                 operation_id: settings.operation_id.clone(),
                 block_is_running: settings.block_is_running,
@@ -605,21 +791,77 @@ impl Lifecycle {
                 apply_started_at: settings.apply_started_at,
                 apply_error: settings.apply_error.clone(),
                 apply_progress: state.apply_progress.clone(),
+                cleanup: None,
+                last_apply_failure: state.last_apply_failure.clone(),
+                apply_attempts: state.apply_attempts,
+                apply_retry_at: state.apply_retry_at,
+                apply_in_progress: self.apply_busy(),
+                dns_progress: None,
+                state_error: None,
             },
-            PersistedSettings::Invalid(_) => protocol::StatusResponse {
+            PersistedSettings::Invalid(reason) => protocol::StatusResponse {
                 operation_id: None,
                 // Fail closed: never report a clean, unblocked machine.
                 block_is_running: true,
                 unlock_delay_secs: None,
                 block_end_at: None,
-                block_phase: protocol::BlockPhase::Active,
+                block_phase: protocol::BlockPhase::Locked,
                 website_count: None,
                 apply_started_at: None,
                 apply_error: None,
                 apply_progress: None,
+                cleanup: None,
+                last_apply_failure: None,
+                apply_attempts: 0,
+                apply_retry_at: None,
+                apply_in_progress: false,
+                dns_progress: None,
+                state_error: Some(reason.clone()),
             },
             PersistedSettings::Missing => protocol::StatusResponse::inactive(),
+        };
+        let dns = state
+            .apply_progress
+            .as_ref()
+            .filter(|progress| progress.stage == protocol::ApplyStage::Resolving)
+            .or_else(|| {
+                state
+                    .candidate
+                    .as_ref()
+                    .map(|candidate| &candidate.progress)
+            });
+        status.dns_progress = dns.map(|progress| resolver::ResolveProgress {
+            completed: progress.completed,
+            total: progress.total,
+            resolved_addresses: progress.resolved_addresses,
+            failed_lookups: progress.failed_lookups,
+        });
+        if status.block_is_running
+            && state.valid_settings().is_some()
+            && status.block_end_at.is_none()
+            && !state
+                .valid_settings()
+                .is_some_and(|settings| settings.rules_applied)
+        {
+            if self.apply_busy() {
+                status.block_phase = protocol::BlockPhase::Applying;
+            } else if state.last_apply_failure.is_some() {
+                status.block_phase = protocol::BlockPhase::ApplyFailed;
+            }
         }
+        if state.retiring {
+            status.cleanup = state.cleanup.clone();
+            status.block_phase = if state
+                .cleanup
+                .as_ref()
+                .is_some_and(|cleanup| cleanup.error.is_some())
+            {
+                protocol::BlockPhase::CleanupFailed
+            } else {
+                protocol::BlockPhase::CleaningUp
+            };
+        }
+        status
     }
 
     fn check_expiry(&self) -> bool {
@@ -644,9 +886,9 @@ impl Lifecycle {
 
         // Deleting the settings file is another early-unblock route; write it back.
         if !settings::secure_settings_file_exists() {
-            eprintln!("walden: the settings file is missing, writing it back");
+            crate::daemon_log!("walden: the settings file is missing, writing it back");
             if let Err(err) = state.persist() {
-                eprintln!("walden: failed to restore the settings file: {err:#}");
+                crate::daemon_log!("walden: failed to restore the settings file: {err:#}");
             }
         }
 
@@ -656,18 +898,31 @@ impl Lifecycle {
         let cache_fresh = state
             .resolved_at
             .is_some_and(|resolved_at| resolved_at.elapsed() < RESOLUTION_TTL);
-        let resolved = cache_fresh.then(|| state.resolved.clone()).flatten();
+        let dns_fresh = state
+            .dns_cache
+            .next_refresh()
+            .is_some_and(|expires| expires > Instant::now());
+        let resolved = (cache_fresh || dns_fresh)
+            .then(|| state.resolved.clone())
+            .flatten();
+        let retry_ready = Self::retry_ready(&state);
         drop(state);
 
         if !rules_applied {
-            self.spawn_apply();
+            if retry_ready {
+                self.spawn_apply();
+            }
+            return;
+        }
+
+        if !retry_ready {
             return;
         }
 
         match resolved {
             Some(resolved) if blocker::is_intact(&block_list, &resolved) => {}
             _ => {
-                eprintln!(
+                crate::daemon_log!(
                     "walden: block rules have drifted, rebuilding them from the saved block list"
                 );
                 self.spawn_apply();
@@ -675,42 +930,131 @@ impl Lifecycle {
         }
     }
 
-    // Retries on failure: a half-removed block with no daemon watching is worse than either alone.
+    fn retry_ready(state: &State) -> bool {
+        !state
+            .last_apply_failure
+            .as_ref()
+            .is_some_and(|failure| failure.requires_action)
+            && state.apply_retry_at.is_none_or(|retry| Utc::now() >= retry)
+    }
+
+    fn retry_apply_if_due(&self) {
+        if self.apply_busy() {
+            return;
+        }
+        let state = self.state();
+        let due = !state.retiring
+            && state.running_blocklist().is_some()
+            && state.last_apply_failure.is_some()
+            && Self::retry_ready(&state);
+        drop(state);
+        if due {
+            self.spawn_apply();
+        }
+    }
+
+    fn cleanup_stage(&self, stage: protocol::CleanupStage) {
+        let mut state = self.state();
+        state.begin_cleanup();
+        state.cleanup.as_mut().unwrap().stage = stage;
+    }
+
+    fn cleanup_failed(
+        &self,
+        stage: protocol::CleanupStage,
+        error: String,
+        remaining: Vec<String>,
+    ) -> bool {
+        let mut state = self.state();
+        state.begin_cleanup();
+        let cleanup = state.cleanup.as_mut().unwrap();
+        cleanup.stage = stage;
+        // Back off persistent errors, but continue automatic recovery.
+        let retry_secs = cleanup.attempts.clamp(1, 30);
+        cleanup.next_retry_at = Some(Utc::now() + TimeDelta::seconds(retry_secs as i64));
+        if cleanup.error.as_deref() != Some(&error) {
+            crate::daemon_log!(
+                "walden: cleanup failed during {stage:?}: {error}; retrying automatically"
+            );
+        }
+        cleanup.error = Some(error);
+        cleanup.remaining = remaining;
+        false
+    }
+
+    // The saved retirement marker survives every failure, including a restart.
     fn complete_teardown(&self) -> bool {
-        if let Err(err) = (self.teardown.stop_blocking)() {
-            eprintln!("walden: failed to remove blocking rules: {err:#}");
+        if self.apply_busy() {
+            self.cleanup_stage(protocol::CleanupStage::WaitingForApply);
+            return false;
+        }
+        {
+            let mut state = self.state();
+            state.begin_cleanup();
+            let cleanup = state.cleanup.as_mut().unwrap();
+            cleanup.attempts = cleanup.attempts.saturating_add(1);
+            cleanup.next_retry_at = None;
+        }
+        self.cleanup_stage(protocol::CleanupStage::RemovingRules);
+        let removal_error = (self.teardown.stop_blocking)().err();
+        self.cleanup_stage(protocol::CleanupStage::VerifyingRules);
+        let remaining = match (self.teardown.leftovers_present)() {
+            Ok(remaining) => remaining,
+            Err(err) => {
+                let detail = match removal_error {
+                    Some(removal) => format!("{removal:#}; could not verify cleanup: {err:#}"),
+                    None => format!("could not verify cleanup: {err:#}"),
+                };
+                return self.cleanup_failed(
+                    protocol::CleanupStage::VerifyingRules,
+                    detail,
+                    Vec::new(),
+                );
+            }
+        };
+        if let Some(err) = removal_error {
+            return self.cleanup_failed(
+                protocol::CleanupStage::RemovingRules,
+                format!("{err:#}"),
+                remaining,
+            );
+        }
+        if !remaining.is_empty() {
+            return self.cleanup_failed(
+                protocol::CleanupStage::VerifyingRules,
+                "blocking rules or runtime files remain".into(),
+                remaining,
+            );
         }
 
-        match (self.teardown.leftovers_present)() {
-            Ok(false) => match (self.teardown.retire_daemon)() {
-                Ok(()) => {
-                    let mut state = self.state();
-                    if let Some(mut settings) = state.valid_settings().cloned()
-                        && !settings.block_is_running
-                        && settings.block_end_at.is_some()
-                    {
-                        settings.block_end_at = None;
-                        if let Err(err) = state.persist_replacement(settings) {
-                            eprintln!("walden: failed to finish the retirement record: {err:#}");
-                            return false;
-                        }
-                    }
-                    true
-                }
-                Err(err) => {
-                    eprintln!("walden: daemon retirement failed: {err:#}");
-                    false
-                }
-            },
-            Ok(true) => {
-                eprintln!("walden: cleanup incomplete; retrying");
-                false
-            }
-            Err(err) => {
-                eprintln!("walden: could not verify cleanup: {err:#}");
-                false
+        // Disable autostart before clearing the durable marker. Retirement
+        // keeps IPC available until the final save succeeds, so failures remain
+        // visible. Keep rejecting starts until this process actually exits.
+        self.cleanup_stage(protocol::CleanupStage::RetiringDaemon);
+        if let Err(err) = (self.teardown.retire_daemon)() {
+            return self.cleanup_failed(
+                protocol::CleanupStage::RetiringDaemon,
+                format!("daemon retirement failed: {err:#}"),
+                Vec::new(),
+            );
+        }
+        self.cleanup_stage(protocol::CleanupStage::SavingState);
+        let settings = self.state().valid_settings().cloned();
+        if let Some(mut settings) = settings
+            && !settings.block_is_running
+            && settings.block_end_at.is_some()
+        {
+            settings.block_end_at = None;
+            let saved = self.state().persist_replacement(settings);
+            if let Err(err) = saved {
+                return self.cleanup_failed(
+                    protocol::CleanupStage::SavingState,
+                    format!("failed to finish the retirement record: {err:#}"),
+                    Vec::new(),
+                );
             }
         }
+        true
     }
 }
 
@@ -722,18 +1066,33 @@ pub fn run(lifecycle: &Lifecycle) -> ! {
             match lifecycle.state().mark_block_finished() {
                 Ok(()) => {}
                 Err(err) => {
-                    eprintln!("walden: failed to persist the completed block: {err:#}");
+                    crate::daemon_log!("walden: failed to persist the completed block: {err:#}");
                 }
             }
         }
 
         if lifecycle.state().retiring {
             if lifecycle.apply_busy() {
+                lifecycle.cleanup_stage(protocol::CleanupStage::WaitingForApply);
+                thread::sleep(TICK);
+                continue;
+            }
+
+            if lifecycle
+                .state()
+                .cleanup
+                .as_ref()
+                .and_then(|cleanup| cleanup.next_retry_at)
+                .is_some_and(|retry| Utc::now() < retry)
+            {
                 thread::sleep(TICK);
                 continue;
             }
 
             if lifecycle.complete_teardown() {
+                if let Err(err) = crate::common::remove_file_if_present(protocol::SOCKET_PATH) {
+                    crate::daemon_log!("walden: failed to remove the daemon socket: {err:#}");
+                }
                 std::process::exit(0);
             }
 
@@ -745,6 +1104,8 @@ pub fn run(lifecycle: &Lifecycle) -> ! {
             lifecycle.check_integrity();
             next_integrity_check = Instant::now() + INTEGRITY_INTERVAL;
         }
+
+        lifecycle.retry_apply_if_due();
 
         thread::sleep(TICK);
     }
@@ -773,9 +1134,10 @@ mod tests {
 
     fn resolve_all(
         hosts: &[String],
+        cache: &mut resolver::ResolutionCache,
         progress: &mut dyn FnMut(resolver::ResolveProgress) -> bool,
     ) -> BTreeSet<ResolvedAddr> {
-        resolver::resolve_all_with_progress(hosts, progress)
+        resolver::resolve_cached(hosts, cache, progress)
     }
 
     fn apply_fails(_: &[String], _: &BTreeSet<ResolvedAddr>) -> anyhow::Result<()> {
@@ -789,6 +1151,7 @@ mod tests {
 
     fn resolve_slowly(
         hosts: &[String],
+        _cache: &mut resolver::ResolutionCache,
         progress: &mut dyn FnMut(resolver::ResolveProgress) -> bool,
     ) -> BTreeSet<ResolvedAddr> {
         let total = hosts.len();
@@ -818,8 +1181,8 @@ mod tests {
         Ok(())
     }
 
-    fn nothing_left() -> anyhow::Result<bool> {
-        Ok(false)
+    fn nothing_left() -> anyhow::Result<Vec<String>> {
+        Ok(Vec::new())
     }
 
     fn lifecycle_with_settings(settings: PersistedSettings) -> Lifecycle {
@@ -858,9 +1221,17 @@ mod tests {
                 apply_generation: 0,
                 apply_progress: None,
                 retiring: false,
+                cleanup: None,
+                dns_cache: resolver::ResolutionCache::default(),
+                candidate: None,
+                apply_retry_delay_secs: 5,
+                last_apply_failure: None,
+                apply_attempts: 0,
+                apply_retry_at: None,
             })),
             apply_hosts: hosts_ok,
             apply_block,
+            prepare_firewall: || Ok(()),
             resolve_all,
             teardown,
             apply_in_progress: Arc::new(AtomicBool::new(false)),
@@ -869,7 +1240,7 @@ mod tests {
     }
 
     fn retiring_lifecycle(
-        leftovers_present: fn() -> anyhow::Result<bool>,
+        leftovers_present: fn() -> anyhow::Result<Vec<String>>,
         retire_daemon: fn() -> anyhow::Result<()>,
     ) -> Lifecycle {
         lifecycle_with_teardown(
@@ -938,6 +1309,7 @@ mod tests {
 
     fn resolve_old_addresses(
         hosts: &[String],
+        _cache: &mut resolver::ResolutionCache,
         progress: &mut dyn FnMut(resolver::ResolveProgress) -> bool,
     ) -> BTreeSet<ResolvedAddr> {
         dns_result(hosts, progress, &["203.0.113.1", "2001:db8::1"], 0)
@@ -945,6 +1317,7 @@ mod tests {
 
     fn resolve_new_addresses(
         hosts: &[String],
+        _cache: &mut resolver::ResolutionCache,
         progress: &mut dyn FnMut(resolver::ResolveProgress) -> bool,
     ) -> BTreeSet<ResolvedAddr> {
         dns_result(hosts, progress, &["203.0.113.2", "2001:db8::2"], 0)
@@ -952,6 +1325,7 @@ mod tests {
 
     fn resolve_partial_addresses(
         hosts: &[String],
+        _cache: &mut resolver::ResolutionCache,
         progress: &mut dyn FnMut(resolver::ResolveProgress) -> bool,
     ) -> BTreeSet<ResolvedAddr> {
         dns_result(hosts, progress, &["203.0.113.2"], 1)
@@ -959,6 +1333,7 @@ mod tests {
 
     fn resolve_no_addresses(
         hosts: &[String],
+        _cache: &mut resolver::ResolutionCache,
         progress: &mut dyn FnMut(resolver::ResolveProgress) -> bool,
     ) -> BTreeSet<ResolvedAddr> {
         dns_result(hosts, progress, &[], hosts.len())
@@ -1193,6 +1568,9 @@ mod tests {
         assert!(!lifecycle.state().valid_settings().unwrap().rules_applied);
 
         lifecycle.resolve_all = resolve_partial_addresses;
+        // Force a fresh DNS pass instead of reusing a firewall retry candidate.
+        lifecycle.state().candidate.as_mut().unwrap().expires =
+            Instant::now() - Duration::from_secs(1);
         lifecycle.run_apply();
         assert_eq!(
             lifecycle.state().resolved,
@@ -1207,6 +1585,9 @@ mod tests {
         lifecycle.state().save_settings = save_ok;
         lifecycle.apply_block = apply_ok;
         lifecycle.resolve_all = resolve_new_addresses;
+        // Force a fresh DNS pass instead of reusing a firewall retry candidate.
+        lifecycle.state().candidate.as_mut().unwrap().expires =
+            Instant::now() - Duration::from_secs(1);
         lifecycle.run_apply();
         assert_eq!(lifecycle.status().block_phase, protocol::BlockPhase::Active);
         assert_eq!(
@@ -1223,7 +1604,11 @@ mod tests {
 
         let status = lifecycle.status();
         assert!(status.block_is_running);
-        assert_eq!(status.block_phase, protocol::BlockPhase::Active);
+        assert_eq!(status.block_phase, protocol::BlockPhase::Locked);
+        assert_eq!(
+            status.state_error.as_deref(),
+            Some("unsupported settings version")
+        );
         assert_eq!(status.unlock_delay_secs, None);
         assert_eq!(status.block_end_at, None);
         assert!(!lifecycle.check_expiry());
@@ -1522,6 +1907,7 @@ mod tests {
 
         fn paused_resolution(
             hosts: &[String],
+            cache: &mut resolver::ResolutionCache,
             progress: &mut dyn FnMut(resolver::ResolveProgress) -> bool,
         ) -> BTreeSet<ResolvedAddr> {
             if !progress(resolver::ResolveProgress {
@@ -1535,7 +1921,7 @@ mod tests {
             let (ready, resume) = RESOLVER_GATE.lock().unwrap().take().unwrap();
             ready.send(()).unwrap();
             resume.recv_timeout(Duration::from_secs(5)).unwrap();
-            resolve_all(hosts, progress)
+            resolve_all(hosts, cache, progress)
         }
 
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -1620,6 +2006,14 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("still being cleaned up"));
         assert!(!lifecycle.status().block_is_running);
+        assert_eq!(
+            lifecycle.status().block_phase,
+            protocol::BlockPhase::CleaningUp
+        );
+        assert_eq!(
+            lifecycle.stop().unwrap(),
+            protocol::StopOutcome::CleanupPending
+        );
     }
 
     #[test]
@@ -1633,8 +2027,12 @@ mod tests {
             Ok(())
         }
 
-        fn leftovers() -> anyhow::Result<bool> {
-            Ok(CLEANUP_ATTEMPTS.load(Ordering::SeqCst) < 2)
+        fn leftovers() -> anyhow::Result<Vec<String>> {
+            Ok(if CLEANUP_ATTEMPTS.load(Ordering::SeqCst) < 2 {
+                vec!["injected leftover PF rules".into()]
+            } else {
+                Vec::new()
+            })
         }
 
         CLEANUP_ATTEMPTS.store(0, Ordering::SeqCst);
@@ -1655,9 +2053,46 @@ mod tests {
         lifecycle.resume();
         assert!(lifecycle.state().retiring);
         assert!(!lifecycle.complete_teardown());
+        let status = lifecycle.status();
+        assert_eq!(status.block_phase, protocol::BlockPhase::CleanupFailed);
+        let progress = status.cleanup.unwrap();
+        assert_eq!(progress.stage, protocol::CleanupStage::RemovingRules);
+        assert!(
+            progress
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("injected cleanup failure")
+        );
+        assert_eq!(progress.remaining, ["injected leftover PF rules"]);
+        assert_eq!(progress.attempts, 1);
+        assert!(progress.next_retry_at.is_some());
+        let refused = lifecycle
+            .start("next-block".into(), vec!["example.org".into()], 1)
+            .unwrap_err();
+        assert!(refused.to_string().contains("cleanup failed"));
+        assert!(refused.to_string().contains("status --verbose"));
         assert!(lifecycle.complete_teardown());
         assert_eq!(CLEANUP_ATTEMPTS.load(Ordering::SeqCst), 2);
         assert_eq!(lifecycle.status().block_end_at, None);
+        // Until this process exits, a new start must not race its clean exit.
+        assert!(
+            lifecycle
+                .start("next-block".into(), vec!["example.org".into()], 1)
+                .is_err()
+        );
+        let persisted = lifecycle.state().valid_settings().unwrap().clone();
+        let restarted = lifecycle_with_settings(PersistedSettings::Valid(persisted));
+        restarted.resume();
+        assert_eq!(
+            restarted.status().block_phase,
+            protocol::BlockPhase::Inactive
+        );
+        restarted
+            .start("next-block".into(), vec!["127.0.0.1".into()], 1)
+            .unwrap();
+        wait_for_apply(&restarted);
+        assert_eq!(restarted.status().block_phase, protocol::BlockPhase::Active);
     }
 
     #[test]
@@ -1705,8 +2140,8 @@ mod tests {
     fn a_daemon_is_not_retired_while_part_of_the_block_is_still_installed() {
         static RETIREMENTS: AtomicUsize = AtomicUsize::new(0);
 
-        fn something_left() -> anyhow::Result<bool> {
-            Ok(true)
+        fn something_left() -> anyhow::Result<Vec<String>> {
+            Ok(vec!["injected leftover PF rules".into()])
         }
 
         fn retire() -> anyhow::Result<()> {
@@ -1724,7 +2159,7 @@ mod tests {
     fn a_daemon_is_not_retired_when_the_cleanup_cannot_be_verified() {
         static RETIREMENTS: AtomicUsize = AtomicUsize::new(0);
 
-        fn unverifiable() -> anyhow::Result<bool> {
+        fn unverifiable() -> anyhow::Result<Vec<String>> {
             bail!("injected verification failure")
         }
 
@@ -1775,11 +2210,11 @@ mod tests {
         static QUERIES: AtomicUsize = AtomicUsize::new(0);
         static RETIREMENTS: AtomicUsize = AtomicUsize::new(0);
 
-        fn verify() -> anyhow::Result<bool> {
+        fn verify() -> anyhow::Result<Vec<String>> {
             if QUERIES.fetch_add(1, Ordering::SeqCst) == 0 {
                 bail!("injected firewall query failure");
             }
-            Ok(false)
+            Ok(Vec::new())
         }
 
         fn retire() -> anyhow::Result<()> {
@@ -1817,5 +2252,187 @@ mod tests {
         assert_eq!(QUERIES.load(Ordering::SeqCst), 2);
         assert_eq!(RETIREMENTS.load(Ordering::SeqCst), 1);
         assert_eq!(lifecycle.status().block_end_at, None);
+    }
+
+    #[test]
+    fn failed_cleanup_save_preserves_marker_and_reports_the_failed_stage() {
+        let mut settings = running_settings();
+        settings.block_is_running = false;
+        settings.block_end_at = Some(Utc::now());
+        let marker = settings.block_end_at;
+        let lifecycle = lifecycle_with_teardown(
+            PersistedSettings::Valid(settings),
+            save_fails,
+            apply_ok,
+            Teardown {
+                stop_blocking: unblock_ok,
+                leftovers_present: nothing_left,
+                retire_daemon: || Ok(()),
+            },
+        );
+        lifecycle.resume();
+        assert!(!lifecycle.complete_teardown());
+        let status = lifecycle.status();
+        assert_eq!(status.block_phase, protocol::BlockPhase::CleanupFailed);
+        assert_eq!(status.block_end_at, marker);
+        let cleanup = status.cleanup.unwrap();
+        assert_eq!(cleanup.stage, protocol::CleanupStage::SavingState);
+        assert!(
+            cleanup
+                .error
+                .unwrap()
+                .contains("injected persistence failure")
+        );
+        lifecycle.state().save_settings = save_ok;
+        assert!(lifecycle.complete_teardown());
+        assert_eq!(lifecycle.status().block_end_at, None);
+    }
+
+    #[test]
+    fn cleanup_waits_for_apply_workers_before_removing_rules() {
+        let lifecycle = retiring_lifecycle(nothing_left, || Ok(()));
+        lifecycle.apply_in_progress.store(true, Ordering::SeqCst);
+        assert!(!lifecycle.complete_teardown());
+        let status = lifecycle.status();
+        assert_eq!(status.block_phase, protocol::BlockPhase::CleaningUp);
+        assert_eq!(
+            status.cleanup.unwrap().stage,
+            protocol::CleanupStage::WaitingForApply
+        );
+        lifecycle.apply_in_progress.store(false, Ordering::SeqCst);
+        assert!(lifecycle.complete_teardown());
+    }
+
+    #[test]
+    fn missing_settings_with_orphaned_rules_are_locked() {
+        let lifecycle = lifecycle_with_teardown(
+            PersistedSettings::Missing,
+            save_ok,
+            apply_ok,
+            Teardown {
+                stop_blocking: unblock_ok,
+                leftovers_present: || Ok(vec!["PF block rules".into()]),
+                retire_daemon: || Ok(()),
+            },
+        );
+        lifecycle.resume();
+        let status = lifecycle.status();
+        assert_eq!(status.block_phase, protocol::BlockPhase::Locked);
+        assert!(status.state_error.unwrap().contains("PF block rules"));
+        assert!(
+            lifecycle
+                .start("new-operation".into(), vec!["example.com".into()], 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn permanent_pf_preparation_failure_skips_dns_and_requires_action() {
+        let mut lifecycle = lifecycle_with_settings(PersistedSettings::Missing);
+        lifecycle.prepare_firewall =
+            || Err(blocker::pf::ConfigurationError("invalid parent filtering order".into()).into());
+        lifecycle.resolve_all = |_, _, _| panic!("must validate PF before DNS");
+        lifecycle
+            .start("prepare-failure".into(), vec!["host.test".into()], 1)
+            .unwrap();
+        wait_for_apply(&lifecycle);
+        let status = lifecycle.status();
+        assert_eq!(status.block_phase, protocol::BlockPhase::ApplyFailed);
+        let failure = status.last_apply_failure.unwrap();
+        assert_eq!(failure.stage, protocol::ApplyStage::PreparingFirewall);
+        assert!(failure.requires_action);
+        assert!(status.apply_retry_at.is_none());
+        lifecycle.retry_apply_if_due();
+        assert_eq!(lifecycle.status().apply_attempts, 1);
+        assert_eq!(
+            lifecycle.stop().unwrap(),
+            protocol::StopOutcome::ApplyCancelled
+        );
+    }
+
+    #[test]
+    fn apply_backoff_counts_failures_instead_of_successful_refreshes() {
+        let lifecycle = lifecycle_with_settings(PersistedSettings::Valid(running_settings()));
+        lifecycle.state().apply_attempts = 100;
+        let error = anyhow::anyhow!("temporary command failure");
+        lifecycle.record_apply_error(0, true, &error);
+        assert_eq!(lifecycle.state().apply_retry_delay_secs, 10);
+        assert!((lifecycle.status().apply_retry_at.unwrap() - Utc::now()).num_seconds() <= 5);
+        lifecycle.record_apply_error(0, true, &error);
+        assert_eq!(lifecycle.state().apply_retry_delay_secs, 20);
+        lifecycle.mark_rules_applied(0);
+        assert_eq!(lifecycle.state().apply_retry_delay_secs, 5);
+    }
+
+    #[test]
+    fn firewall_retry_reuses_dns_candidates_without_publishing_failed_coverage() {
+        static DNS_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static INSTALL_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn resolve(
+            hosts: &[String],
+            _: &mut resolver::ResolutionCache,
+            progress: &mut dyn FnMut(resolver::ResolveProgress) -> bool,
+        ) -> BTreeSet<ResolvedAddr> {
+            DNS_CALLS.fetch_add(1, Ordering::SeqCst);
+            dns_result(hosts, progress, &["203.0.113.1", "2001:db8::1"], 0)
+        }
+        fn install(_: &[String], _: &BTreeSet<ResolvedAddr>) -> anyhow::Result<()> {
+            if INSTALL_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+                bail!("temporary firewall command failure");
+            }
+            Ok(())
+        }
+        DNS_CALLS.store(0, Ordering::SeqCst);
+        INSTALL_CALLS.store(0, Ordering::SeqCst);
+        let mut lifecycle =
+            lifecycle_with_dependencies(PersistedSettings::Missing, save_ok, install);
+        lifecycle.resolve_all = resolve;
+        lifecycle
+            .start("cached-retry".into(), vec!["host.test".into()], 1)
+            .unwrap();
+        wait_for_apply(&lifecycle);
+        let failed = lifecycle.status();
+        assert_eq!(
+            failed.last_apply_failure.unwrap().stage,
+            protocol::ApplyStage::InstallingFirewall
+        );
+        assert_eq!(failed.dns_progress.unwrap().total, 1);
+        assert_eq!(failed.apply_progress.unwrap().resolved_addresses, 2);
+        assert!(lifecycle.state().resolved.is_none());
+        assert!(lifecycle.state().candidate.is_some());
+        lifecycle.retry_apply_if_due();
+        assert_eq!(INSTALL_CALLS.load(Ordering::SeqCst), 1);
+        lifecycle.state().apply_retry_at = Some(Utc::now() - TimeDelta::seconds(1));
+        lifecycle.retry_apply_if_due();
+        wait_for_apply(&lifecycle);
+        assert_eq!(DNS_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(INSTALL_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(lifecycle.status().block_phase, protocol::BlockPhase::Active);
+        assert!(lifecycle.status().last_apply_failure.is_none());
+    }
+
+    #[test]
+    fn removal_errors_are_not_hidden_by_an_empty_leftover_query() {
+        let lifecycle = lifecycle_with_teardown(
+            PersistedSettings::Missing,
+            save_ok,
+            apply_ok,
+            Teardown {
+                stop_blocking: || bail!("PF access denied"),
+                leftovers_present: nothing_left,
+                retire_daemon: || panic!("must not retire"),
+            },
+        );
+        assert!(!lifecycle.complete_teardown());
+        let status = lifecycle.status();
+        assert_eq!(status.block_phase, protocol::BlockPhase::CleanupFailed);
+        assert!(
+            status
+                .cleanup
+                .unwrap()
+                .error
+                .unwrap()
+                .contains("PF access denied")
+        );
     }
 }

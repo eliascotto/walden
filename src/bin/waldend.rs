@@ -115,6 +115,8 @@ fn main() {
         return;
     }
 
+    walden::logging::init_daemon();
+
     let lifecycle = Lifecycle::from_disk();
 
     // Kick off restoration without waiting for DNS or rule writes, so the
@@ -128,7 +130,7 @@ fn main() {
     if lifecycle.status().block_is_running
         && let Err(err) = service::ensure_autostart_enabled()
     {
-        eprintln!("walden: failed to keep the daemon enabled at startup: {err:#}");
+        walden::daemon_log!("walden: failed to keep the daemon enabled at startup: {err:#}");
     }
 
     // The socket server gets its own thread: the loop below owns the block and
@@ -139,7 +141,7 @@ fn main() {
         // losing the socket is reported rather than fatal.
         if let Err(err) = ipc::start_server(move |stream| handle_client(&server_lifecycle, stream))
         {
-            eprintln!("walden: the IPC server stopped: {err}");
+            walden::daemon_log!("walden: the IPC server stopped: {err}");
         }
     });
 

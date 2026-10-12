@@ -11,6 +11,9 @@
   KeepAlive/SuccessfulExit: launchd restarts the daemon if it dies, but treats
   the clean exit it makes after a completed block as final. This is the launchd
   spelling of the systemd unit's Restart=on-failure.
+
+  Daemon diagnostics use native syslog, since launchd's default stderr is
+  /dev/null. `walden status --verbose` prints the system-log query.
 -->
 <plist version="1.0">
 <dict>

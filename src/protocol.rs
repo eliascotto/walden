@@ -10,7 +10,7 @@ use crate::build_info::BuildInfo;
 use crate::ipc;
 
 pub const SOCKET_PATH: &str = "/var/run/waldend.sock";
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize)]
 pub enum ClientMessage {
@@ -133,6 +133,7 @@ pub enum CommandResponse {
 #[serde(rename_all = "snake_case")]
 pub enum StopOutcome {
     AlreadyInactive,
+    CleanupPending,
     ApplyCancelled,
     Ending { block_end_at: DateTime<Utc> },
     AlreadyEnding { block_end_at: DateTime<Utc> },
@@ -146,14 +147,67 @@ pub enum BlockPhase {
     Active,
     Ending,
     ApplyFailed,
+    CleaningUp,
+    CleanupFailed,
+    Locked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupStage {
+    WaitingForApply,
+    RemovingRules,
+    VerifyingRules,
+    RetiringDaemon,
+    SavingState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CleanupProgress {
+    pub stage: CleanupStage,
+    pub started_at: DateTime<Utc>,
+    pub attempts: u64,
+    pub error: Option<String>,
+    pub remaining: Vec<String>,
+    pub next_retry_at: Option<DateTime<Utc>>,
+}
+
+impl CleanupProgress {
+    pub fn new() -> Self {
+        Self {
+            stage: CleanupStage::WaitingForApply,
+            started_at: Utc::now(),
+            attempts: 0,
+            error: None,
+            remaining: Vec::new(),
+            next_retry_at: None,
+        }
+    }
+}
+
+impl Default for CleanupProgress {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyStage {
     WritingHosts,
+    PreparingFirewall,
     Resolving,
     InstallingFirewall,
+    SavingState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApplyFailure {
+    pub stage: ApplyStage,
+    pub message: String,
+    pub failed_at: DateTime<Utc>,
+    pub attempt: u64,
+    pub requires_action: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -176,6 +230,13 @@ pub struct StatusResponse {
     pub apply_started_at: Option<DateTime<Utc>>,
     pub apply_error: Option<String>,
     pub apply_progress: Option<ApplyProgress>,
+    pub cleanup: Option<CleanupProgress>,
+    pub state_error: Option<String>,
+    pub last_apply_failure: Option<ApplyFailure>,
+    pub apply_attempts: u64,
+    pub apply_retry_at: Option<DateTime<Utc>>,
+    pub apply_in_progress: bool,
+    pub dns_progress: Option<crate::resolver::ResolveProgress>,
 }
 
 impl StatusResponse {
@@ -190,6 +251,13 @@ impl StatusResponse {
             apply_started_at: None,
             apply_error: None,
             apply_progress: None,
+            cleanup: None,
+            state_error: None,
+            last_apply_failure: None,
+            apply_attempts: 0,
+            apply_retry_at: None,
+            apply_in_progress: false,
+            dns_progress: None,
         }
     }
 }
@@ -198,6 +266,34 @@ impl StatusResponse {
 mod tests {
     use super::*;
     use std::thread;
+
+    #[test]
+    fn cleanup_failure_and_stop_outcome_round_trip_over_ipc() {
+        let mut status = StatusResponse::inactive();
+        status.block_phase = BlockPhase::CleanupFailed;
+        status.cleanup = Some(CleanupProgress {
+            stage: CleanupStage::RemovingRules,
+            started_at: Utc::now(),
+            attempts: 2,
+            error: Some("PF file removal failed".into()),
+            remaining: vec!["/var/run/waldend-pf-token".into()],
+            next_retry_at: Some(Utc::now()),
+        });
+        let (mut client, mut daemon) = UnixStream::pair().unwrap();
+        ipc::send_json(&mut daemon, &status).unwrap();
+        assert_eq!(
+            ipc::receive_json::<StatusResponse>(&mut client).unwrap(),
+            status
+        );
+        let stopped = CommandResponse::StopCompleted {
+            outcome: StopOutcome::CleanupPending,
+        };
+        ipc::send_json(&mut daemon, &stopped).unwrap();
+        assert_eq!(
+            ipc::receive_json::<CommandResponse>(&mut client).unwrap(),
+            stopped
+        );
+    }
 
     #[test]
     fn matching_builds_complete_the_handshake() {

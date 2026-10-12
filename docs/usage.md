@@ -28,8 +28,14 @@ Daemon: running
 Block: applying — resolving hostnames 27%
 ```
 
-The reported phases are `writing hosts`, `resolving hostnames`, and
-`installing firewall rules`. Resolution remains bounded to 64 workers even for
+Normal status shows the current stage: `writing hosts`, `preparing firewall rules`,
+`resolving hostnames`, `installing firewall rules`, or `saving activation state`.
+The percentage during resolution measures hostnames checked, including failed
+lookups. Reaching 100% means DNS checks are complete; wait for `Block: active`
+to confirm the rules are installed. Address counts, unresolved hostname counts,
+and failure diagnostics are available with `walden status --verbose`.
+
+Resolution remains bounded to 64 workers even for
 the largest catalog. Walden resolves eagerly because the firewall layer blocks
 the addresses that hostnames resolve to in addition to writing `/etc/hosts`;
 skipping this step would materially weaken the block. Progress is incremental,
@@ -124,6 +130,43 @@ local snapshot, the same way `WALDEN_CONFIG_DIR` moves the configuration.
 [packaging.md](packaging.md) has more on what the package installs.
 
 ## Persistence, recovery, and upgrades
+
+Run `walden status` to check apply, countdown, and cleanup state. Use
+`walden status --verbose` for technical progress and failure details. `walden start --wait`
+waits for its own accepted operation to become active; Ctrl+C stops waiting,
+and the daemon continues applying the block.
+
+If a start is refused because previous cleanup is pending, no new block has
+been started. Status reports `cleaning up` or `cleanup failed`; verbose status
+includes the failing step and the next automatic retry. A running daemon alone does not mean
+it is ready to accept another block. After cleanup completes, the daemon exits;
+status returns to `installed but not running` / `not active`.
+
+A firewall setup error can fail a pending start even when DNS resolution succeeds.
+Verbose status separates the last failure's stage from current retry progress;
+DNS counts always refer to hostnames, and firewall counts refer to addresses.
+Transient apply failures retry with backoff and reuse fresh DNS candidates.
+Persistent configuration errors require action; inspect the verbose error,
+repair the configuration, then cancel the pending start with `walden stop`
+before starting again. Hosts entries can remain during a failed pending start.
+
+For detailed daemon diagnostics, run the log command printed by
+`walden status --verbose`. On macOS:
+
+```console
+log show --last 1h --predicate 'process == "waldend"'
+```
+
+On Linux:
+
+```console
+journalctl -u waldend.service --since '1 hour ago'
+```
+
+The unlock delay starts after `walden stop`; setting it to one second does
+not make a new block expire one second after starting it. The deadline cannot
+be shortened after activation. Rule cleanup can take additional time after
+that deadline, and status reports this separately.
 
 The block remains active after logout, restart, or ordinary app deletion. A
 privileged system daemon enforces it, managed by launchd on macOS and systemd

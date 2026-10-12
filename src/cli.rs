@@ -1,10 +1,11 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::io::IsTerminal;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail, ensure};
 use chrono::{Local, Utc};
@@ -13,8 +14,26 @@ use dialoguer::{Confirm, Input, MultiSelect, theme::ColorfulTheme};
 
 use walden::{build_info, catalog, ipc, protocol, service, user_config};
 
-const LARGE_BLOCK_NOTICE: usize = 1_000;
 static OPERATION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+pub struct ForwardExit(pub i32);
+
+impl std::fmt::Display for ForwardExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "privileged command exited with status {}", self.0)
+    }
+}
+impl std::error::Error for ForwardExit {}
+
+#[derive(Debug)]
+struct StartRejected(String);
+impl std::fmt::Display for StartRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::error::Error for StartRejected {}
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -48,11 +67,21 @@ enum CommandSet {
         /// Defaults to `unlock_delay` from the configuration file.
         #[arg(long, value_name = "DURATION")]
         unlock_delay: Option<String>,
+        /// Follow progress until rules are active; Ctrl+C only stops waiting
+        #[arg(long)]
+        wait: bool,
     },
     /// Request that the active block end after its fixed delay
     Stop,
     /// Check the status of the system
-    Status,
+    Status {
+        /// Internal diagnostics: show changes every second until Ctrl+C
+        #[arg(long, hide = true)]
+        watch: bool,
+        /// Include operation, timing, DNS, and daemon log details
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Create or update the configuration
     Setup {
         /// Category IDs to block (repeatable). Use with `--unlock-delay` to skip prompts.
@@ -88,11 +117,11 @@ pub fn run() -> anyhow::Result<()> {
 
     match args.command {
         CommandSet::Version { verbose } => version(verbose),
-        CommandSet::Start { unlock_delay } => {
-            start(config, catalog_snapshot, unlock_delay.as_deref())
+        CommandSet::Start { unlock_delay, wait } => {
+            start(config, catalog_snapshot, unlock_delay.as_deref(), wait)
         }
         CommandSet::Stop => stop(),
-        CommandSet::Status => status(),
+        CommandSet::Status { watch, verbose } => status(watch, verbose),
         CommandSet::Setup {
             categories,
             unlock_delay,
@@ -161,16 +190,13 @@ fn start(
     config_override: Option<&Path>,
     catalog_snapshot: Option<&Path>,
     unlock_delay: Option<&str>,
+    wait: bool,
 ) -> anyhow::Result<()> {
     let (path, config) = user_config::load(config_override)?;
     let catalog = load_catalog(catalog_snapshot)?;
     let (effective, unlock_delay_secs) = prepare_start(&config, &catalog, unlock_delay)?;
 
     let website_count = effective.block_list.len();
-    if website_count >= LARGE_BLOCK_NOTICE && !is_root() {
-        println!("Applying a block for {website_count} websites.");
-        println!("This can take a few minutes; `walden status` shows progress.");
-    }
 
     // Whether the daemon is installed can be read without privileges, so a
     // machine that cannot run a block says so before asking for a password and
@@ -178,11 +204,25 @@ fn start(
     service::verify_ready_to_start()?;
 
     if !is_root() {
-        return rerun_with_sudo(&privileged_start_args(&path, &catalog, unlock_delay)?);
+        let mut args = privileged_start_args(&path, &catalog, unlock_delay)?;
+        if wait {
+            args.push("--wait".into());
+        }
+        return rerun_with_sudo(&args);
     }
 
-    start_block(effective.block_list, unlock_delay_secs)?;
+    let operation_id = start_block(effective.block_list, unlock_delay_secs)?;
     println!("{}", applying_rules_message(website_count));
+    if wait {
+        println!("Waiting for active rules. Ctrl+C stops waiting; the daemon continues.");
+        monitor_status(
+            service::inspect,
+            |output| println!("{output}"),
+            || std::thread::sleep(Duration::from_secs(1)),
+            MonitorMode::WaitForActive(operation_id),
+            false,
+        )?;
+    }
     Ok(())
 }
 
@@ -200,7 +240,9 @@ fn prepare_start(
 }
 
 fn applying_rules_message(website_count: usize) -> String {
-    format!("Applying rules for {website_count} websites. This can take a few minutes.")
+    format!(
+        "Start accepted for {website_count} websites.\nRun `walden status` to check whether rules are active."
+    )
 }
 
 // Asking for the block to end is not privileged: the daemon owns the delay,
@@ -223,11 +265,25 @@ fn stop() -> anyhow::Result<()> {
         protocol::StopOutcome::AlreadyInactive => {
             println!("Daemon is running, but the block is not active, nothing to stop");
         }
-        protocol::StopOutcome::ApplyCancelled => {
-            println!("Apply cancelled. The block was not locked in.");
+        protocol::StopOutcome::CleanupPending => {
+            println!(
+                "The previous block is being cleaned up. Run `walden status` for progress and recovery details."
+            );
         }
-        protocol::StopOutcome::Ending { .. } => {
-            println!("Stop requested. Run `walden status` to monitor the block.");
+        protocol::StopOutcome::ApplyCancelled => {
+            println!(
+                "Start cancelled before the block was locked in. Rules may remain until cleanup finishes; run `walden status`."
+            );
+        }
+        protocol::StopOutcome::Ending { block_end_at } => {
+            let delay = format_duration(
+                seconds_until(block_end_at, Utc::now()),
+                DurationStyle::Compact,
+            );
+            println!(
+                "Stop requested. Unlock delay remaining: {delay}. \
+                 Run `walden status` to monitor the block."
+            );
         }
         protocol::StopOutcome::AlreadyEnding { block_end_at } => {
             println!(
@@ -242,34 +298,136 @@ fn stop() -> anyhow::Result<()> {
 }
 
 // Status is deliberately readable without a password prompt.
-fn status() -> anyhow::Result<()> {
+fn status(watch: bool, verbose: bool) -> anyhow::Result<()> {
+    if watch {
+        println!("Watching status; Ctrl+C stops watching.");
+    }
+    monitor_status(
+        service::inspect,
+        |output| println!("{output}"),
+        || std::thread::sleep(Duration::from_secs(1)),
+        if watch {
+            MonitorMode::Watch
+        } else {
+            MonitorMode::Once
+        },
+        verbose,
+    )
+}
+
+#[derive(Clone, Eq, PartialEq)]
+enum MonitorMode {
+    Once,
+    Watch,
+    WaitForActive(String),
+}
+
+fn monitor_status(
+    mut inspect: impl FnMut() -> anyhow::Result<service::ServiceInspection>,
+    mut emit: impl FnMut(&str),
+    mut pause: impl FnMut(),
+    mode: MonitorMode,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    let mut previous = None;
+    loop {
+        let inspection = inspect()?;
+        let output = render_status(&inspection, verbose);
+        if previous.as_ref() != Some(&output) {
+            if previous.is_some() {
+                emit("");
+            }
+            emit(&output);
+            previous = Some(output);
+        }
+        if mode == MonitorMode::Once {
+            return Ok(());
+        }
+        if let MonitorMode::WaitForActive(expected) = &mode {
+            ensure!(
+                inspection
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.operation_id.as_ref())
+                    == Some(expected),
+                "the accepted block is no longer the current operation; check `walden status --verbose`"
+            );
+            match inspection.status.as_ref().map(|status| status.block_phase) {
+                Some(protocol::BlockPhase::Active) => return Ok(()),
+                Some(protocol::BlockPhase::Applying) => {}
+                Some(protocol::BlockPhase::ApplyFailed) => bail!(
+                    "the daemon accepted the start, but applying rules failed. Check `walden status --verbose`; `walden stop` cancels before activation"
+                ),
+                _ => bail!(
+                    "the accepted block did not become active; check `walden status --verbose` for its current state"
+                ),
+            }
+        }
+        pause();
+    }
+}
+
+fn render_status(inspection: &service::ServiceInspection, verbose: bool) -> String {
     // Reported separately from the block, because a machine without Walden
     // installed and one sitting idle with it installed are both unblocked, and
     // only one of them is something the user has to act on.
-    let inspection = service::inspect()?;
-    print_field("Daemon", &inspection.state.describe());
+    let daemon = if !verbose && matches!(inspection.state, service::ServiceState::Unhealthy(_)) {
+        "unhealthy".into()
+    } else {
+        inspection.state.describe()
+    };
+    let mut lines = vec![format_field("Daemon", &daemon)];
 
     if !inspection.state.is_running() {
-        match inspection.state {
-            service::ServiceState::NotInstalled | service::ServiceState::Inactive => {
-                print_status(None)
-            }
-            service::ServiceState::Starting => {
-                print_field("Block", "unavailable (daemon has not answered yet)")
-            }
-            service::ServiceState::Unhealthy(_) => {
-                print_field("Block", "unavailable (daemon service is unhealthy)")
-            }
+        let block = match &inspection.state {
+            service::ServiceState::NotInstalled | service::ServiceState::Inactive => "not active",
+            service::ServiceState::Starting => "unavailable (daemon has not answered yet)",
+            service::ServiceState::Unhealthy(_) => "unavailable (daemon service is unhealthy)",
             service::ServiceState::Running => unreachable!(),
+        };
+        lines.push(format_field("Block", block));
+    } else if let Some(status) = &inspection.status {
+        lines.extend(
+            describe_block(status, verbose)
+                .into_iter()
+                .map(|(label, value)| format_field(label, &value)),
+        );
+        if verbose {
+            if let Some(operation) = &status.operation_id {
+                lines.push(format_field("Operation", operation));
+            }
+            if let Some(started) = status.apply_started_at {
+                lines.push(format_field("Apply started", &started.to_rfc3339()));
+            }
+            if let Some(progress) = &status.dns_progress {
+                lines.push(format_field(
+                    "DNS",
+                    &format!(
+                        "{}/{} hostnames checked; {} missing or incomplete; {} unique addresses",
+                        progress.completed,
+                        progress.total,
+                        progress.failed_lookups,
+                        progress.resolved_addresses
+                    ),
+                ));
+            }
         }
-        return Ok(());
+    } else {
+        lines.push(format_field(
+            "Block",
+            "unavailable (daemon returned no status)",
+        ));
     }
 
-    let status = inspection
-        .status
-        .context("the daemon was responsive but returned no status")?;
-    print_status(Some(&status));
-    Ok(())
+    if verbose {
+        let log = if cfg!(target_os = "macos") {
+            "log show --last 1h --predicate 'process == \"waldend\"'"
+        } else {
+            "journalctl -u waldend.service --since '1 hour ago'"
+        };
+        lines.push(format_field("Daemon logs", log));
+    }
+    lines.join("\n")
 }
 
 fn setup(
@@ -612,8 +770,19 @@ fn rerun_with_sudo(args: &[String]) -> anyhow::Result<()> {
     }
 
     let status = command.status().context("failed to execute sudo")?;
-    ensure!(status.success(), "privileged command exited with {status}");
-    Ok(())
+    forward_child_status(status)
+}
+
+fn forward_child_status(status: ExitStatus) -> anyhow::Result<()> {
+    if status.success() {
+        return Ok(());
+    }
+    Err(ForwardExit(
+        status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
+    )
+    .into())
 }
 
 fn is_root() -> bool {
@@ -621,7 +790,7 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-fn start_block(block_list: Vec<String>, unlock_delay_secs: u64) -> anyhow::Result<()> {
+fn start_block(block_list: Vec<String>, unlock_delay_secs: u64) -> anyhow::Result<String> {
     ensure!(is_root(), "starting a block requires root privileges");
 
     // Returns only once the installed daemon is up and answering, so the block
@@ -636,7 +805,7 @@ fn start_block(block_list: Vec<String>, unlock_delay_secs: u64) -> anyhow::Resul
     };
     let mut stream = connect_daemon()?;
     match request_start(&mut stream, &message, &operation_id) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(operation_id),
         Err(err) => {
             // The daemon persists a start before it begins slow work.  A lost
             // acknowledgement is therefore recoverable only when the
@@ -649,9 +818,15 @@ fn start_block(block_list: Vec<String>, unlock_delay_secs: u64) -> anyhow::Resul
                 eprintln!(
                     "walden: the daemon did not confirm the request before the IPC deadline, but the matching block is persisted; continuing"
                 );
-                Ok(())
+                Ok(operation_id)
             } else {
-                bail!("failed to start the block: {}", daemon_request_detail(&err))
+                if let Some(rejection) = err.downcast_ref::<StartRejected>() {
+                    bail!("Start refused: {rejection}. No new block was started.");
+                }
+                bail!(
+                    "Start was not confirmed; run `walden status` to check whether it was accepted: {}",
+                    daemon_request_detail(&err)
+                )
             }
         }
     }
@@ -676,9 +851,7 @@ fn request_start(
         protocol::CommandResponse::StopCompleted { .. } => {
             bail!("the daemon returned a stop response to a start request")
         }
-        protocol::CommandResponse::Rejected { message } => {
-            bail!("the daemon rejected the request: {message}")
-        }
+        protocol::CommandResponse::Rejected { message } => Err(StartRejected(message).into()),
     }
 }
 
@@ -783,6 +956,15 @@ fn format_duration(secs: u64, style: DurationStyle) -> String {
     }
 }
 
+fn seconds_until(deadline: chrono::DateTime<Utc>, now: chrono::DateTime<Utc>) -> u64 {
+    let remaining = deadline - now;
+    if remaining <= chrono::TimeDelta::zero() {
+        return 0;
+    }
+    let seconds = remaining.num_seconds();
+    seconds as u64 + u64::from(remaining > chrono::TimeDelta::seconds(seconds))
+}
+
 fn print_field(label: &str, value: &str) {
     println!("{}", format_field(label, value));
 }
@@ -791,97 +973,180 @@ fn format_field(label: &str, value: &str) -> String {
     format!("{label}: {value}")
 }
 
-fn print_status(status: Option<&protocol::StatusResponse>) {
-    let Some(status) = status.filter(|status| status.block_is_running) else {
-        print_field("Block", "not active");
-        return;
+fn describe_block(status: &protocol::StatusResponse, verbose: bool) -> Vec<(&'static str, String)> {
+    use protocol::BlockPhase;
+    let block = match status.block_phase {
+        BlockPhase::Inactive => "not active".into(),
+        BlockPhase::Applying => format!("applying — {}", apply_progress_summary(status, verbose)),
+        BlockPhase::ApplyFailed => {
+            let reason = status
+                .last_apply_failure
+                .as_ref()
+                .map(|failure| match failure.stage {
+                    protocol::ApplyStage::PreparingFirewall
+                    | protocol::ApplyStage::InstallingFirewall => "firewall setup",
+                    protocol::ApplyStage::WritingHosts => "hosts setup",
+                    protocol::ApplyStage::Resolving => "DNS setup",
+                    protocol::ApplyStage::SavingState => "saving state",
+                });
+            reason.map_or_else(
+                || "start failed".into(),
+                |reason| format!("start failed ({reason})"),
+            )
+        }
+        BlockPhase::CleaningUp => "cleaning up".into(),
+        BlockPhase::CleanupFailed => "cleanup failed".into(),
+        BlockPhase::Locked => "unavailable (saved state is unreadable)".into(),
+        BlockPhase::Ending => status.block_end_at.map_or_else(
+            || "ending".into(),
+            |deadline| {
+                format!(
+                    "ending in {}",
+                    format_duration(seconds_until(deadline, Utc::now()), DurationStyle::Compact)
+                )
+            },
+        ),
+        BlockPhase::Active if status.last_apply_failure.is_some() => {
+            "active (rule repair failed)".into()
+        }
+        BlockPhase::Active => "active".into(),
     };
-
-    for (label, value) in describe_block(status) {
-        print_field(label, &value);
+    let mut lines = vec![("Block", block)];
+    let needs_details = matches!(
+        status.block_phase,
+        BlockPhase::ApplyFailed | BlockPhase::CleanupFailed | BlockPhase::Locked
+    ) || (status.block_phase == BlockPhase::Active
+        && status.last_apply_failure.is_some());
+    if needs_details && !verbose {
+        lines.push(("Details", "walden status --verbose".into()));
     }
-}
-
-fn describe_block(status: &protocol::StatusResponse) -> Vec<(&'static str, String)> {
-    match status.block_phase {
-        protocol::BlockPhase::Inactive => vec![("Block", "not active".to_string())],
-        protocol::BlockPhase::Applying => vec![(
-            "Block",
-            format!("applying — {}", apply_progress_summary(status)),
-        )],
-        protocol::BlockPhase::ApplyFailed => {
-            let mut lines = vec![("Block", "apply failed".to_string())];
-            if let Some(error) = &status.apply_error {
-                lines.push(("Error", error.clone()));
-            }
-            if let Some(progress) = &status.apply_progress {
-                lines.push((
-                    "Failed during",
-                    apply_stage_name(progress.stage).to_string(),
-                ));
-            }
+    if status.block_phase == BlockPhase::Active {
+        lines.push((
+            "Unblock delay",
+            status.unlock_delay_secs.map_or_else(
+                || "not set".into(),
+                |secs| format_duration(secs, DurationStyle::Exact),
+            ),
+        ));
+    }
+    if !verbose {
+        return lines;
+    }
+    if let Some(count) = status.website_count {
+        lines.push(("Websites", count.to_string()));
+    }
+    if status.apply_in_progress
+        && let Some(progress) = &status.apply_progress
+    {
+        lines.push(("Current stage", apply_stage_name(progress.stage).into()));
+        if progress.stage == protocol::ApplyStage::InstallingFirewall {
             lines.push((
-                "Websites",
-                status
-                    .website_count
-                    .map(|count| count.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
+                "Firewall addresses",
+                progress.resolved_addresses.to_string(),
             ));
+        }
+    }
+    if let Some(failure) = &status.last_apply_failure {
+        lines.push(("Last failure", failure.message.clone()));
+        lines.push(("Failed during", apply_stage_name(failure.stage).into()));
+        lines.push(("Failure at", failure.failed_at.to_rfc3339()));
+        lines.push(("Attempts", status.apply_attempts.to_string()));
+        if failure.requires_action {
+            lines.push(("Recovery", if status.block_phase == BlockPhase::Active { "configuration needs attention; existing block settings and unlock delay are preserved".into() } else { "configuration needs attention; fix the reported problem, then cancel the pending start with `walden stop` and start again".into() }));
+        } else if let Some(retry) = status.apply_retry_at {
             lines.push((
                 "Retry",
-                "the daemon will keep retrying; `walden stop` cancels".to_string(),
+                format!(
+                    "automatically in {}",
+                    format_duration(seconds_until(retry, Utc::now()), DurationStyle::Compact)
+                ),
             ));
-            lines
+        } else if status.apply_in_progress {
+            lines.push(("Retry", "in progress".into()));
         }
-        protocol::BlockPhase::Ending => {
-            let remaining = status.block_end_at.map(|block_end_at| {
-                format_duration(
-                    (block_end_at - Utc::now()).num_seconds().max(0) as u64,
-                    DurationStyle::Compact,
-                )
-            });
-            let mut lines = vec![(
-                "Block",
-                remaining
-                    .map(|remaining| format!("ending in {remaining}"))
-                    .unwrap_or_else(|| "ending".to_string()),
-            )];
-            if let Some(block_end_at) = status.block_end_at {
-                lines.push((
-                    "Ends at",
-                    block_end_at
-                        .with_timezone(&Local)
-                        .format("%H:%M:%S %Y/%m/%d")
-                        .to_string(),
-                ));
-            }
-            lines
+    } else if let Some(error) = &status.apply_error {
+        // The legacy saved-state format has only an error string. Never guess
+        // its stage from a different attempt's current progress.
+        lines.push(("Previous failure", error.clone()));
+    }
+    if let Some(cleanup) = &status.cleanup {
+        lines.push(("Stage", cleanup_stage_name(cleanup.stage).into()));
+        lines.push((
+            "Cleanup elapsed",
+            format_duration(
+                (Utc::now() - cleanup.started_at).num_seconds().max(0) as u64,
+                DurationStyle::Compact,
+            ),
+        ));
+        lines.push(("Attempts", cleanup.attempts.to_string()));
+        if let Some(error) = &cleanup.error {
+            lines.push(("Error", error.clone()));
         }
-        protocol::BlockPhase::Active => {
-            let delay = match status.unlock_delay_secs {
-                Some(secs) => format_duration(secs, DurationStyle::Exact),
-                None => "not set".to_string(),
-            };
-            vec![("Block", "active".to_string()), ("Unblock delay", delay)]
+        if !cleanup.remaining.is_empty() {
+            lines.push(("Remaining", cleanup.remaining.join(", ")));
         }
+        if let Some(retry) = cleanup.next_retry_at {
+            lines.push((
+                "Retry",
+                format!(
+                    "automatically in {}",
+                    format_duration(seconds_until(retry, Utc::now()), DurationStyle::Compact)
+                ),
+            ));
+        }
+        lines.push((
+            "New blocks",
+            "unavailable until cleanup completes; rules may still be present".into(),
+        ));
+    }
+    if let Some(error) = &status.state_error {
+        lines.push(("Error", error.clone()));
+    }
+    if status.block_phase == BlockPhase::Ending
+        && let Some(deadline) = status.block_end_at
+    {
+        lines.push((
+            "Ends at",
+            deadline
+                .with_timezone(&Local)
+                .format("%H:%M:%S %Y/%m/%d")
+                .to_string(),
+        ));
+    }
+    lines
+}
+
+fn cleanup_stage_name(stage: protocol::CleanupStage) -> &'static str {
+    match stage {
+        protocol::CleanupStage::WaitingForApply => "waiting for cancelled apply work to finish",
+        protocol::CleanupStage::RemovingRules => "removing hosts and firewall rules",
+        protocol::CleanupStage::VerifyingRules => "verifying hosts and firewall cleanup",
+        protocol::CleanupStage::RetiringDaemon => "disabling daemon autostart",
+        protocol::CleanupStage::SavingState => "saving completed cleanup",
     }
 }
 
 fn apply_stage_name(stage: protocol::ApplyStage) -> &'static str {
     match stage {
         protocol::ApplyStage::WritingHosts => "writing hosts",
+        protocol::ApplyStage::PreparingFirewall => "preparing firewall rules",
         protocol::ApplyStage::Resolving => "resolving hostnames",
         protocol::ApplyStage::InstallingFirewall => "installing firewall rules",
+        protocol::ApplyStage::SavingState => "saving activation state",
     }
 }
 
-fn apply_progress_summary(status: &protocol::StatusResponse) -> String {
+fn apply_progress_summary(status: &protocol::StatusResponse, verbose: bool) -> String {
     let Some(progress) = &status.apply_progress else {
-        return format!("{} websites", status.website_count.unwrap_or(0));
+        return if verbose {
+            format!("{} websites", status.website_count.unwrap_or(0))
+        } else {
+            "starting".into()
+        };
     };
 
     match progress.stage {
-        protocol::ApplyStage::WritingHosts => {
+        protocol::ApplyStage::WritingHosts if verbose => {
             format!("writing hosts for {} websites", progress.total)
         }
         protocol::ApplyStage::Resolving => {
@@ -892,7 +1157,7 @@ fn apply_progress_summary(status: &protocol::StatusResponse) -> String {
                 .unwrap_or(100);
             format!("resolving hostnames {percent}%")
         }
-        protocol::ApplyStage::InstallingFirewall => {
+        protocol::ApplyStage::InstallingFirewall if verbose => {
             let unresolved = if progress.failed_lookups == 0 {
                 String::new()
             } else {
@@ -903,6 +1168,7 @@ fn apply_progress_summary(status: &protocol::StatusResponse) -> String {
                 progress.resolved_addresses
             )
         }
+        stage => apply_stage_name(stage).into(),
     }
 }
 
@@ -919,7 +1185,7 @@ mod tests {
         )
         .unwrap();
         let args = Args::try_parse_from(["walden", "start"]).unwrap();
-        let CommandSet::Start { unlock_delay } = args.command else {
+        let CommandSet::Start { unlock_delay, .. } = args.command else {
             panic!("expected a start command");
         };
 
@@ -937,7 +1203,7 @@ mod tests {
         .unwrap();
         let args =
             Args::try_parse_from(["walden", "start", "--unlock-delay", "2 minutes"]).unwrap();
-        let CommandSet::Start { unlock_delay } = args.command else {
+        let CommandSet::Start { unlock_delay, .. } = args.command else {
             panic!("expected a start command");
         };
 
@@ -974,7 +1240,7 @@ mod tests {
     fn accepted_start_tells_the_user_to_follow_progress_separately() {
         assert_eq!(
             applying_rules_message(344_932),
-            "Applying rules for 344932 websites. This can take a few minutes."
+            "Start accepted for 344932 websites.\nRun `walden status` to check whether rules are active."
         );
     }
 
@@ -1077,6 +1343,13 @@ mod tests {
             website_count: Some(44971),
             apply_started_at: Some(Utc::now() - chrono::TimeDelta::seconds(65)),
             apply_error: None,
+            cleanup: None,
+            state_error: None,
+            last_apply_failure: None,
+            apply_attempts: 0,
+            apply_retry_at: None,
+            apply_in_progress: true,
+            dns_progress: None,
             apply_progress: Some(protocol::ApplyProgress {
                 stage: protocol::ApplyStage::Resolving,
                 completed: 12_400,
@@ -1089,10 +1362,59 @@ mod tests {
 
     #[test]
     fn status_describes_an_in_progress_apply() {
-        let lines = describe_block(&applying_status());
+        let lines = describe_block(&applying_status(), true);
+        assert!(lines.contains(&("Block", "applying — resolving hostnames 27%".into())));
+        assert!(lines.contains(&("Current stage", "resolving hostnames".into())));
         assert_eq!(
-            lines,
-            vec![("Block", "applying — resolving hostnames 27%".to_string())]
+            describe_block(&applying_status(), false),
+            vec![("Block", "applying — resolving hostnames 27%".into())]
+        );
+    }
+
+    #[test]
+    fn normal_status_shows_apply_stages_without_diagnostic_counts() {
+        let mut status = applying_status();
+        for (stage, summary) in [
+            (protocol::ApplyStage::WritingHosts, "writing hosts"),
+            (
+                protocol::ApplyStage::PreparingFirewall,
+                "preparing firewall rules",
+            ),
+            (
+                protocol::ApplyStage::InstallingFirewall,
+                "installing firewall rules",
+            ),
+            (protocol::ApplyStage::SavingState, "saving activation state"),
+        ] {
+            status.apply_progress.as_mut().unwrap().stage = stage;
+            let inspection = service::ServiceInspection {
+                state: service::ServiceState::Running,
+                status: Some(status.clone()),
+            };
+            assert_eq!(
+                render_status(&inspection, false),
+                format!("Daemon: running\nBlock: applying — {summary}")
+            );
+        }
+    }
+
+    #[test]
+    fn normal_status_labels_dns_completion_without_claiming_activation() {
+        let mut status = applying_status();
+        for (completed, expected) in [(0, "0%"), (44_971, "100%")] {
+            status.apply_progress.as_mut().unwrap().completed = completed;
+            assert_eq!(
+                describe_block(&status, false),
+                vec![(
+                    "Block",
+                    format!("applying — resolving hostnames {expected}"),
+                )]
+            );
+        }
+        status.apply_progress = None;
+        assert_eq!(
+            describe_block(&status, false),
+            vec![("Block", "applying — starting".into())]
         );
     }
 
@@ -1109,21 +1431,12 @@ mod tests {
         let mut status = applying_status();
         status.block_phase = protocol::BlockPhase::ApplyFailed;
         status.apply_error = Some("injected backend failure".to_string());
+        status.apply_in_progress = false;
 
-        let lines = describe_block(&status);
-        assert_eq!(
-            lines,
-            vec![
-                ("Block", "apply failed".to_string()),
-                ("Error", "injected backend failure".to_string()),
-                ("Failed during", "resolving hostnames".to_string()),
-                ("Websites", "44971".to_string()),
-                (
-                    "Retry",
-                    "the daemon will keep retrying; `walden stop` cancels".to_string()
-                ),
-            ]
-        );
+        let lines = describe_block(&status, true);
+        assert!(lines.contains(&("Block", "start failed".into())));
+        assert!(lines.contains(&("Previous failure", "injected backend failure".into())));
+        assert!(!lines.iter().any(|(label, _)| *label == "Failed during"));
     }
 
     #[test]
@@ -1133,11 +1446,275 @@ mod tests {
         status.apply_started_at = None;
 
         assert_eq!(
-            describe_block(&status),
+            describe_block(&status, false),
             vec![
                 ("Block", "active".to_string()),
                 ("Unblock delay", "1 minute".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn cleanup_is_rendered_even_when_the_block_is_no_longer_running() {
+        let mut status = protocol::StatusResponse::inactive();
+        status.block_phase = protocol::BlockPhase::CleanupFailed;
+        status.cleanup = Some(protocol::CleanupProgress {
+            stage: protocol::CleanupStage::VerifyingRules,
+            started_at: Utc::now() - chrono::TimeDelta::seconds(60),
+            attempts: 3,
+            error: Some("PF query failed: Permission denied".into()),
+            remaining: vec!["PF table walden_blocked".into()],
+            next_retry_at: Some(Utc::now() + chrono::TimeDelta::seconds(5)),
+        });
+        let output = render_status(
+            &service::ServiceInspection {
+                state: service::ServiceState::Running,
+                status: Some(status),
+            },
+            true,
+        );
+        assert!(output.contains("Block: cleanup failed"));
+        assert!(output.contains("Stage: verifying hosts and firewall cleanup"));
+        assert!(output.contains("Attempts: 3"));
+        assert!(output.contains("Permission denied"));
+        assert!(output.contains("Remaining: PF table walden_blocked"));
+        assert!(output.contains("Retry: automatically"));
+        assert!(output.contains("Daemon logs:"));
+        assert!(!output.contains("Block: not active"));
+    }
+
+    #[test]
+    fn waiting_follows_the_accepted_operation_until_active() {
+        let mut snapshots = vec![applying_status(), applying_status()];
+        snapshots[1].block_phase = protocol::BlockPhase::Active;
+        let mut snapshots = snapshots.into_iter();
+        let mut output = Vec::new();
+        let mut pauses = 0;
+        monitor_status(
+            || {
+                Ok(service::ServiceInspection {
+                    state: service::ServiceState::Running,
+                    status: Some(snapshots.next().unwrap()),
+                })
+            },
+            |line| output.push(line.to_owned()),
+            || pauses += 1,
+            MonitorMode::WaitForActive("operation-1".into()),
+            false,
+        )
+        .unwrap();
+        assert_eq!(pauses, 1);
+        assert!(output[0].contains("Block: applying"));
+        assert!(output.last().unwrap().contains("Block: active"));
+    }
+
+    #[test]
+    fn waiting_reports_apply_failure_without_claiming_the_start_was_rejected() {
+        let mut failed = applying_status();
+        failed.block_phase = protocol::BlockPhase::ApplyFailed;
+        failed.apply_error = Some("firewall write failed".into());
+        let mut output = String::new();
+        let error = monitor_status(
+            || {
+                Ok(service::ServiceInspection {
+                    state: service::ServiceState::Running,
+                    status: Some(failed.clone()),
+                })
+            },
+            |line| output.push_str(line),
+            || panic!("should stop waiting on failure"),
+            MonitorMode::WaitForActive("operation-1".into()),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("accepted the start"));
+        assert!(output.contains("Block: start failed"));
+        assert!(!output.contains("firewall write failed"));
+    }
+
+    #[test]
+    fn waiting_cannot_report_a_different_block_as_success() {
+        let mut replaced = applying_status();
+        replaced.operation_id = Some("different-operation".into());
+        replaced.block_phase = protocol::BlockPhase::Active;
+        let error = monitor_status(
+            || {
+                Ok(service::ServiceInspection {
+                    state: service::ServiceState::Running,
+                    status: Some(replaced.clone()),
+                })
+            },
+            |_| {},
+            || {},
+            MonitorMode::WaitForActive("operation-1".into()),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no longer the current operation")
+        );
+    }
+
+    #[test]
+    fn watch_suppresses_unchanged_snapshots_and_shows_recovery() {
+        let mut cleanup = protocol::StatusResponse::inactive();
+        cleanup.block_phase = protocol::BlockPhase::CleaningUp;
+        // Fixed snapshot has no elapsed clock so only a phase change prints.
+        let mut snapshots = vec![
+            cleanup.clone(),
+            cleanup,
+            protocol::StatusResponse::inactive(),
+        ]
+        .into_iter();
+        let mut output = Vec::new();
+        let result = monitor_status(
+            || match snapshots.next() {
+                Some(status) => Ok(service::ServiceInspection {
+                    state: service::ServiceState::Running,
+                    status: Some(status),
+                }),
+                None => bail!("end of test snapshots"),
+            },
+            |line| {
+                if !line.is_empty() {
+                    output.push(line.to_owned());
+                }
+            },
+            || {},
+            MonitorMode::Watch,
+            false,
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("end of test snapshots")
+        );
+        assert_eq!(output.len(), 2);
+        assert!(output[0].contains("Block: cleaning up"));
+        assert!(output[1].contains("Block: not active"));
+    }
+
+    #[test]
+    fn privileged_exit_codes_are_forwarded_without_an_additional_diagnostic() {
+        forward_child_status(ExitStatus::from_raw(0)).unwrap();
+        let error = forward_child_status(ExitStatus::from_raw(7 << 8)).unwrap_err();
+        assert_eq!(error.downcast_ref::<ForwardExit>().unwrap().0, 7);
+        let interrupted = forward_child_status(ExitStatus::from_raw(libc::SIGINT)).unwrap_err();
+        assert_eq!(
+            interrupted.downcast_ref::<ForwardExit>().unwrap().0,
+            128 + libc::SIGINT
+        );
+    }
+
+    #[test]
+    fn monitoring_options_are_accepted_by_the_cli_parser() {
+        assert!(matches!(
+            Args::try_parse_from(["walden", "start", "--wait"])
+                .unwrap()
+                .command,
+            CommandSet::Start { wait: true, .. }
+        ));
+        assert!(matches!(
+            Args::try_parse_from(["walden", "status", "--watch", "--verbose"])
+                .unwrap()
+                .command,
+            CommandSet::Status {
+                watch: true,
+                verbose: true
+            }
+        ));
+    }
+
+    #[test]
+    fn current_retry_and_previous_failure_have_independent_stages() {
+        let mut status = applying_status();
+        status.apply_error = Some("old PF error".into());
+        status.last_apply_failure = Some(protocol::ApplyFailure {
+            stage: protocol::ApplyStage::InstallingFirewall,
+            message: "old PF error".into(),
+            failed_at: Utc::now(),
+            attempt: 1,
+            requires_action: false,
+        });
+        status.apply_attempts = 2;
+        let lines = describe_block(&status, true);
+        assert!(lines.contains(&("Current stage", "resolving hostnames".into())));
+        assert!(lines.contains(&("Failed during", "installing firewall rules".into())));
+        assert!(lines.contains(&("Retry", "in progress".into())));
+        let normal = describe_block(&status, false);
+        assert_eq!(
+            normal,
+            vec![("Block", "applying — resolving hostnames 27%".into())]
+        );
+    }
+
+    #[test]
+    fn normal_failure_output_is_short_and_keeps_raw_diagnostics_verbose() {
+        let mut status = applying_status();
+        status.block_phase = protocol::BlockPhase::ApplyFailed;
+        status.apply_in_progress = false;
+        status.last_apply_failure = Some(protocol::ApplyFailure {
+            stage: protocol::ApplyStage::PreparingFirewall,
+            message: "native PF parser error".into(),
+            failed_at: Utc::now(),
+            attempt: 1,
+            requires_action: true,
+        });
+        let inspection = service::ServiceInspection {
+            state: service::ServiceState::Running,
+            status: Some(status),
+        };
+        let normal = render_status(&inspection, false);
+        assert_eq!(
+            normal,
+            "Daemon: running\nBlock: start failed (firewall setup)\nDetails: walden status --verbose"
+        );
+        let verbose = render_status(&inspection, true);
+        assert!(verbose.contains("native PF parser error"));
+        assert!(verbose.contains("Failed during: preparing firewall rules"));
+        assert!(verbose.contains("configuration needs attention"));
+        assert!(!verbose.contains("retrying automatically"));
+    }
+
+    #[test]
+    fn firewall_address_progress_cannot_be_printed_as_dns_hostnames() {
+        let mut status = applying_status();
+        status.apply_progress.as_mut().unwrap().stage = protocol::ApplyStage::InstallingFirewall;
+        status.apply_progress.as_mut().unwrap().resolved_addresses = 6584;
+        status.dns_progress = Some(walden::resolver::ResolveProgress {
+            completed: 2187,
+            total: 2187,
+            failed_lookups: 186,
+            resolved_addresses: 6584,
+        });
+        let verbose = render_status(
+            &service::ServiceInspection {
+                state: service::ServiceState::Running,
+                status: Some(status),
+            },
+            true,
+        );
+        assert!(verbose.contains("DNS: 2187/2187 hostnames checked"));
+        assert!(verbose.contains("Firewall addresses: 6584"));
+        assert!(!verbose.contains("6584/6584 hostnames"));
+    }
+
+    #[test]
+    fn countdown_does_not_show_zero_before_a_one_second_delay_expires() {
+        let now = Utc::now();
+        assert_eq!(
+            seconds_until(now + chrono::TimeDelta::milliseconds(999), now),
+            1
+        );
+        assert_eq!(seconds_until(now + chrono::TimeDelta::seconds(1), now), 1);
+        assert_eq!(
+            seconds_until(now + chrono::TimeDelta::milliseconds(1001), now),
+            2
+        );
+        assert_eq!(seconds_until(now, now), 0);
+        assert_eq!(seconds_until(now - chrono::TimeDelta::seconds(1), now), 0);
     }
 }

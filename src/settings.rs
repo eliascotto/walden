@@ -333,13 +333,13 @@ pub fn save_secure_settings_file(settings: &Settings) -> anyhow::Result<()> {
     if path.exists()
         && let Err(err) = set_immutable(&path, false)
     {
-        eprintln!("Warning: failed to clear the immutable flag: {err}");
+        crate::daemon_log!("Warning: failed to clear the immutable flag: {err}");
     }
 
     write_secure_settings_file(&settings)?;
     // State is already committed; immutable-flag failure is not a write failure.
     if let Err(err) = set_immutable(&path, true) {
-        eprintln!("Warning: failed to set the immutable flag: {err}");
+        crate::daemon_log!("Warning: failed to set the immutable flag: {err}");
     }
     Ok(())
 }

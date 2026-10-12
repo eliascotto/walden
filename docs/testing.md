@@ -64,6 +64,24 @@ Stop-persistence failures leave the current apply generation and progress intact
 Tests pause a worker during resolution and verify that it still completes after
 a rejected stop, and that retrying a stop after persistence recovers cancels once.
 
+Cleanup regression tests cover failure followed by recovery and a new start
+after daemon restart, truthful status while `block_is_running` is false,
+failed final-state persistence, worker cancellation, missing state with orphaned
+rules, and retirement races. PF tests inject cleanup operations and query output;
+they check scoped rule/table flushes, empty detached anchors, partial failure,
+failed reload recovery after disk changes, and repeated cleanup of absent anchors.
+The macOS parser test invokes `pfctl` with `-n` to parse native output without
+loading rules. A local UDP blackhole tests the native resolver's timeout;
+it does not change system DNS settings. CLI tests cover watch snapshots,
+operation-specific waiting, apply failure, and sudo exit-status forwarding.
+
+PF verification also covers normalization rules before the first filtering
+anchor, genuine earlier filtering rules, and query errors. Apply regressions
+cover validation before DNS, action-required errors, candidate reuse after a
+firewall failure, separate current/previous stages, and consistent DNS units.
+Resolver tests cover positive/negative caching, selective temporary retries,
+backoff, retained address-family coverage, and draining cancelled workers.
+
 The CLI integration suite also exercises catalog selection with an absent,
 empty/incomplete, and invalid update cache. It verifies silent fallback for
 absence, one concise repair notice for recoverable cache damage, no raw
@@ -119,6 +137,23 @@ Every release:
    remains. Attempt removal during an active block: the block is not lifted
    (on macOS the uninstaller refuses without `--force`).
 
+For the cleanup/output fixes:
+
+- Run `walden start --wait` with a one-second unlock delay. It must show
+  acceptance followed by `active`; it must not expire until `walden stop`.
+- Run `walden status` repeatedly, or `walden status --verbose` for details. After `stop`,
+  expect `ending`, then `cleaning up` when observable, then an inactive daemon
+  and block. A very short phase may complete between one-second snapshots.
+- Start a second block after cleanup; it must succeed without restarting or
+  removing the package.
+- On a disposable VM, inject a temporary failure during PF cleanup. Verbose status
+  must show `cleanup failed` and the actual error, and a rejected start must
+  not announce application or print a second sudo error. Repair the failure;
+  cleanup must recover automatically and allow a subsequent start.
+- Upgrade with cleanup pending; the saved retirement marker must resume cleanup.
+- Confirm the system-log command printed by verbose status shows daemon errors
+  on macOS. These privileged checks remain manual VM checks.
+
 When packaging, the daemon, or persisted state changed — or when you want a
 deeper pass:
 
@@ -136,6 +171,14 @@ deeper pass:
   [packaging.md](packaging.md).
 
 ## Development install and cleanup
+
+### Internal status monitoring
+
+`walden status --watch --verbose` is an internal developer diagnostics option.
+It polls once per second and prints changed snapshots until Ctrl+C. It remains
+accepted by the parser but is hidden from normal help and user documentation.
+User-facing guidance should recommend `walden status`, with `--verbose` when
+technical details are needed.
 
 To put a checkout on a machine the way a package would:
 

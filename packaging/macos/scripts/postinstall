@@ -20,7 +20,7 @@ if [ ! -e "$MARKER" ]; then
   exit 0
 fi
 
-echo "Walden was running a block; restarting its daemon on the new version."
+echo "Walden's daemon was running; restarting it to resume its saved state."
 
 # The job ships disabled so that installing Walden does not start it, and the
 # replaced property list says so again. launchd keeps its enable override

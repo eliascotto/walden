@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, ensure};
 
-use crate::common;
 use crate::ipc;
 use crate::protocol::{self, SOCKET_PATH};
 
@@ -60,7 +59,7 @@ pub struct ServiceRecord {
 }
 
 enum DaemonProbe {
-    Responsive(protocol::StatusResponse),
+    Responsive(Box<protocol::StatusResponse>),
     Unreachable,
     Incompatible(String),
 }
@@ -157,7 +156,7 @@ pub fn inspect() -> anyhow::Result<ServiceInspection> {
     let probe = should_probe.then(daemon_probe);
 
     let (responsive, status, incompatibility) = match probe {
-        Some(DaemonProbe::Responsive(status)) => (true, Some(status), None),
+        Some(DaemonProbe::Responsive(status)) => (true, Some(*status), None),
         Some(DaemonProbe::Incompatible(reason)) => (false, None, Some(reason)),
         Some(DaemonProbe::Unreachable) | None => (false, None, None),
     };
@@ -211,7 +210,7 @@ fn daemon_probe() -> DaemonProbe {
         return DaemonProbe::Unreachable;
     }
     match ipc::receive_json::<protocol::StatusResponse>(&mut stream) {
-        Ok(status) => DaemonProbe::Responsive(status),
+        Ok(status) => DaemonProbe::Responsive(Box::new(status)),
         Err(ipc::IpcError::InvalidMessage(err)) => {
             DaemonProbe::Incompatible(format!("the daemon returned invalid status: {err}"))
         }
@@ -305,7 +304,8 @@ pub fn retire_daemon() -> anyhow::Result<()> {
     platform::disable_autostart()
         .context("failed to stop the Walden daemon service from starting again")?;
 
-    common::remove_file_if_present(SOCKET_PATH).context("failed to remove the daemon socket")?;
+    // Keep status reachable until the lifecycle has saved completed cleanup.
+    // The daemon removes the socket immediately before its clean exit.
     Ok(())
 }
 

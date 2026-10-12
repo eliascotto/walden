@@ -100,18 +100,36 @@ edge cases and troubleshooting are in [usage.md](usage.md).
 7. `walden start` returns after durable acceptance. If the acknowledgement is
    lost, recovery succeeds only when status reports the same operation ID;
    matching counts or delays are not treated as proof. `walden status` shows
-   `applying` until enforcement is active.
+   `applying` until enforcement is active. `start --wait` follows the accepted
+   operation ID and returns success only when that operation is active.
 
-During apply, status reports writing hosts, hostname-resolution counts, or
+During apply, verbose status reports writing hosts, initial firewall preparation, hostname-resolution counts, or
 firewall installation. Resolution uses a fixed pool of at most 64 workers and
 does not hold the lifecycle lock while performing DNS, so status and stop
 requests remain available. Cancelling an apply prevents any remaining queued
 lookups from starting.
 
+Initial PF wiring is validated before expensive resolution. Native DNS requests
+use one UDP attempt per server with a two-second per-server wait. Truncated
+answers are classified as incomplete instead of entering Darwin's unbounded
+native TCP fallback. Resolver workers are drained after cancellation, keeping
+the concurrency bound across attempts. Successful answers are cached for 15
+minutes, negative answers for five minutes, and temporary failures back off
+from 30 seconds to five minutes. DNS caches are specific to the current block.
+
+Candidate DNS results are separate from successfully installed firewall coverage.
+An initial firewall retry reuses fresh candidates; refresh failures retain
+working installed addresses. Transient apply errors back off from five seconds
+to five minutes. Persistent PF validation failures require action instead of
+repeating the full apply. Failure stage/time/attempt are runtime diagnostics;
+the existing saved-state format remains unchanged. A resumed legacy error has
+no recorded stage and is never assigned the new attempt's current stage.
+
 `walden status` uses the status response that established daemon readiness; it
 does not probe and then issue the same request again. `walden stop` likewise
 sends one direct request. Its response distinguishes an inactive block, a
-cancelled apply, a newly scheduled ending, and an ending already in progress.
+cancelled apply, cleanup already in progress, a newly scheduled ending, and an
+ending already in progress.
 The socket server has a fixed worker pool and bounded pending queue, so stalled
 local clients cannot create an unbounded number of daemon threads.
 Each newline-terminated JSON frame is limited to 16 MiB before the newline and
@@ -131,6 +149,13 @@ When a block ends, the daemon removes its rules, verifies that nothing is left,
 tells the service manager not to start it again, removes its socket, and exits
 cleanly.
 
+The saved retirement marker is cleared only after rule verification and service
+disablement succeed. The socket remains available until this final save succeeds,
+so a persistence failure can still be explained by status. New starts remain
+rejected until the retiring process exits, preventing acceptance immediately
+before that exit. No saved-state schema change is needed for cleanup diagnostics;
+after a restart the existing durable marker triggers cleanup again.
+
 Both service definitions are configured to treat that clean exit as the end of
 the daemon and a crash as something to restart, so exiting is the second half of
 retirement and not a separate stop command the daemon would have to issue
@@ -142,8 +167,17 @@ against itself.
   unit file stays installed.
 
 Every step can be repeated to no effect, so a retirement that fails part way
-through is retried on the next tick rather than unwound. The daemon does not
+through is retried automatically rather than unwound. The daemon does not
 retire while any part of the block is still installed, or while it cannot check.
+
+Failures back off from one second to at most 30 seconds. Status exposes the
+cleanup stage, error, remaining rules/files, attempt count, elapsed time, and
+next retry. PF cleanup flushes only Walden's filtering rules and tables,
+skips absent anchors, and reloads the main configuration only when Walden's
+disk or live parent reference needs removing. Detached empty anchors do not
+count as remaining enforcement. Runtime files stay in place after a failed
+configuration reload; subsequent attempts inspect live state and retry it even
+when the on-disk reference has already been removed.
 
 ## Restart and recovery
 

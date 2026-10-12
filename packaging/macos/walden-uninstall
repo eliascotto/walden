@@ -126,14 +126,15 @@ remove_persisted_state() {
 # nothing is left to remove them when the block expires.
 if daemon_is_running && [ "$force" = "no" ]; then
   cat >&2 <<EOF
-walden: a block is active.
+walden: the daemon is still running; a block may be active or cleanup may be pending.
 
 Removing Walden stops its daemon but does not lift the block. The hosts
 entries and firewall rules stay in place, and nothing will remove them when
 the block ends. Reinstalling Walden lets the daemon finish the block from its
 persisted state.
 
-Wait for the block to end, or pass --force to remove Walden anyway.
+Run 'walden status' and wait for the block and cleanup to finish,
+or pass --force to remove Walden anyway.
 EOF
   exit 1
 fi

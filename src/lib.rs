@@ -11,6 +11,7 @@ pub mod entry;
 mod fetch;
 pub mod ipc;
 pub mod lifecycle;
+pub mod logging;
 pub mod protocol;
 pub mod resolver;
 pub mod service;

@@ -271,6 +271,8 @@ fn start_validates_the_configuration_and_delay_before_elevation() {
     let invalid_config = walden(&["--config", &path_arg, "start"]);
     assert!(!invalid_config.status.success());
     assert!(String::from_utf8_lossy(&invalid_config.stderr).contains("unknown category"));
+    assert!(!String::from_utf8_lossy(&invalid_config.stdout).contains("Applying"));
+    assert!(!String::from_utf8_lossy(&invalid_config.stdout).contains("Start accepted"));
 
     fs::write(
         &path,
@@ -479,4 +481,18 @@ fn verbose_version_identifies_the_cli_build() {
     assert!(stdout.contains(&build.build_id));
     assert!(stdout.contains(&format!("Protocol: {}", walden::protocol::PROTOCOL_VERSION)));
     assert!(stdout.contains(&build.target));
+}
+
+#[test]
+fn help_explains_monitoring_and_waiting_without_starting_a_daemon() {
+    let start = walden(&["start", "--help"]);
+    assert!(start.status.success());
+    let start_help = String::from_utf8_lossy(&start.stdout);
+    assert!(start_help.contains("--wait"));
+    assert!(start_help.contains("Ctrl+C only stops waiting"));
+    let status = walden(&["status", "--help"]);
+    assert!(status.status.success());
+    let status_help = String::from_utf8_lossy(&status.stdout);
+    assert!(!status_help.contains("--watch"));
+    assert!(status_help.contains("--verbose"));
 }
