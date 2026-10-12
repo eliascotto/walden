@@ -1,8 +1,8 @@
 # Walden
 
-A CLI tool designed to hard block websites that are known to be harmful or addictive. Created to help users be more productive and prevent brain rot.
+A destkop CLI tool to hard block websites that are known to be harmful or addictive. Created to help users be more productive and prevent brain rot. Works on MacOS and Linux.
 
-The book *Walden* by [Henry David Thoreau](https://en.wikipedia.org/wiki/Henry_David_Thoreau) is the first use of the term ["brain-rot"](https://en.wikipedia.org/wiki/Brain_rot).
+The term “brain rot” first appeared in English in *Walden*, by [Henry David Thoreau](https://en.wikipedia.org/wiki/Henry_David_Thoreau).
 
 > While England endeavours to cure the potato rot, will not any endeavour to cure the brain-rot – which prevails so much more widely and fatally?
 >
@@ -12,14 +12,17 @@ The book *Walden* by [Henry David Thoreau](https://en.wikipedia.org/wiki/Henry_D
 
 ## Quick start
 
-[Install the package for your system](#installation). Then choose what to block and start:
+To configure Walden and choose which categories to block and how long to wait before unlocking run:
 
 ```console
 walden setup
-walden start
 ```
 
-`setup` asks which categories to block and how long to wait before unlocking.
+Then start the block when you are ready with:
+
+```console
+walden start
+```
 
 Check progress. If rules are still applying, run this again until it shows `Block: active`:
 
@@ -27,7 +30,7 @@ Check progress. If rules are still applying, run this again until it shows `Bloc
 walden status
 ```
 
-When you’re ready to end the block:
+When you want to end the block:
 
 ```console
 walden stop
@@ -42,6 +45,8 @@ Sites remain blocked for the unlock delay you chose during setup. Once the block
 | `walden setup` | Create or update the config (wizard or flags) |
 | `walden start` | Start a block; delay locks in once rules are applied |
 | `walden status` | Daemon + block state |
+| `walden status --verbose` | Show progress, failures, retries, and diagnostic details |
+| `walden start --wait` | Wait until the accepted block's rules are active |
 | `walden stop` | Request end; sites stay blocked until the delay expires |
 | `walden categories` | List catalog IDs |
 | `walden catalog update` | Refresh the catalog snapshot |
@@ -61,30 +66,23 @@ The configuration defines:
 
 After starting Walden, the active block is locked. Editing the configuration file does not change it.
 
-Start a block with `walden start`. The delay comes from the configuration; pass
-`--unlock-delay` only to override it for that block. To end it, run `walden stop`.
 **The websites remain blocked for the delay fixed at start**, after which access
 is restored automatically. The waiting period cannot be shortened or cancelled
-once the block is active.
-
-The block remains active after logout, restart, or ordinary app deletion.
-
-Walden supports macOS and Linux systems that use systemd and nftables. Other
-Linux service managers and firewall backends are not currently supported.
+once the block is active. The block remains active after logout, restart, or ordinary app deletion.
 
 ## Installation
 
-Download the package for your system from [Releases](https://github.com/eliascotto/walden/releases) and confirm it against `SHA256SUMS`.
+Download the installer for your system from [Releases](https://github.com/eliascotto/walden/releases).
 
-Walden is installed by a platform package. Installing Walden blocks nothing and starts no background process.
+For maximum safety, before installing, calculate the installer’s SHA-256 checksum and compare it with the value listed for that filename in `SHA256SUMS` to check that the download is complete and unchanged.
+
+Installing Walden blocks nothing and starts no background process.
 
 | System | Architectures | Install |
 | --- | --- | --- |
 | macOS 12 and later | `arm64`, `x86_64` | Open `walden-<version>-macos-<arch>.pkg` |
 | Debian-based Linux | `amd64`, `arm64` | `sudo apt install ./walden_<version>-1_<arch>.deb` |
 | Arch Linux | `x86_64`, `aarch64` | `makepkg -si` from the recipe |
-
-Each macOS package is one architecture. The installer refuses a package built for the other one.
 
 ### Unsigned macOS packages
 
@@ -207,8 +205,16 @@ for a password. Large category lists can take a few minutes to apply;
 daemon keeps applying rules in the background; use `walden status` to follow
 progress and confirm when enforcement is active.
 
-Apply progress identifies the current phase: writing hosts, resolving
-hostnames with a completion percentage, or installing firewall rules. DNS
+`walden start` prints `Start accepted` only after the daemon saves the request.
+Use `walden start --wait` to follow that block until it becomes active; an apply
+failure returns a nonzero exit code and explains whether the daemon is retrying.
+Ctrl+C stops waiting; the daemon continues its work. Run `walden status`
+to check the block, or `walden status --verbose` for technical details.
+
+Normal status shows the current apply stage and the percentage of hostnames
+checked during DNS resolution. That percentage describes DNS progress; firewall
+installation still follows. Verbose status adds counts and diagnostics. The last
+failure is recorded separately from the current attempt's progress. DNS
 resolution uses at most 64 workers regardless of catalog size, and a stop
 during apply prevents remaining queued lookups from starting.
 
@@ -230,6 +236,23 @@ While a block is active, expect `Block: active` and an unblock delay. After
 `walden stop`, expect `Block: ending in …` until the delay expires.
 If an active service has not answered, block state is reported as `unavailable`
 rather than incorrectly claiming that no block is active.
+
+After the delay expires, status shows `cleaning up` until hosts and firewall
+rules are verified as removed. `cleanup failed` points to `--verbose` for the failed step,
+actual error, remaining rules/files when known, elapsed time, attempts, and the
+next automatic retry. New blocks remain unavailable until cleanup finishes.
+An invalid saved state is shown as `unavailable` with a locked-daemon explanation,
+instead of being presented as an active or inactive block.
+
+Use `walden status --verbose` for the operation ID, apply timing, DNS details,
+and the command to read daemon logs. macOS diagnostics go to the system log;
+Linux diagnostics go to the service journal.
+
+Initial firewall validation happens before DNS resolution. Transient failures
+retry with backoff and reuse fresh DNS results. A persistent firewall validation
+error requires action; verbose status explains it, and `walden stop` cancels
+the pending start before you start again. Missing DNS answers do not prevent
+hosts blocking or installation of available firewall addresses.
 
 ## Further reading
 
