@@ -5,11 +5,11 @@ categories = [
     "network-programming",
 ]
 name = "walden"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 default-run = "walden"
-description = "Blocks distracting websites with an unblock-delay."
-license = "GPL-3.0-or-later"
+description = "CLI tool to hard-blocks harmful websites."
+license = "GPL-3.0"
 repository = "https://github.com/eliascotto/walden"
 homepage = "https://github.com/eliascotto/walden"
 readme = "README.md"
