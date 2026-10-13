@@ -74,6 +74,8 @@ The macOS parser test invokes `pfctl` with `-n` to parse native output without
 loading rules. A local UDP blackhole tests the native resolver's timeout;
 it does not change system DNS settings. CLI tests cover watch snapshots,
 operation-specific waiting, apply failure, and sudo exit-status forwarding.
+Status rendering tests verify that daemon state appears only with `--verbose`,
+while normal output preserves block availability, progress, and unblock delay.
 
 PF verification also covers normalization rules before the first filtering
 anchor, genuine earlier filtering rules, and query errors. Apply regressions
@@ -122,11 +124,13 @@ Every release:
 
 1. Confirm the package inspects cleanly with `scripts/inspect-package.sh`, then
    install it.
-2. `walden status` must read `installed but not running` / `not active`.
+2. `walden status` must read `Block: not active`, with no `Daemon:` field.
+   `walden status --verbose` must also read `Daemon: installed but not running`.
    Nothing may have started `waldend`.
 3. `walden setup --categories social-media --unlock-delay "30 seconds"`, then
    `walden start`. Success means the daemon durably accepted the block. Poll
-   `walden status` until it shows `running` / `active`; `/etc/hosts` then has
+   `walden status` until it shows `Block: active` and the unblock delay;
+   `walden status --verbose` must also show `Daemon: running`. `/etc/hosts` then has
    the `#<walden>` section and the platform firewall has Walden's rules.
 4. Rerun `walden setup` with a different category or delay while the block is
    active: the file updates, custom websites in it stay, and `walden status`
@@ -142,8 +146,9 @@ For the cleanup/output fixes:
 - Run `walden start --wait` with a one-second unlock delay. It must show
   acceptance followed by `active`; it must not expire until `walden stop`.
 - Run `walden status` repeatedly, or `walden status --verbose` for details. After `stop`,
-  expect `ending`, then `cleaning up` when observable, then an inactive daemon
-  and block. A very short phase may complete between one-second snapshots.
+  expect `ending`, then `cleaning up` when observable, then `Block: not active`.
+  Verbose status must also show the inactive daemon. A very short phase may
+  complete between one-second snapshots.
 - Start a second block after cleanup; it must succeed without restarting or
   removing the package.
 - On a disposable VM, inject a temporary failure during PF cleanup. Verbose status

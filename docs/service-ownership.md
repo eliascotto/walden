@@ -78,8 +78,9 @@ about a package-owned definition, not the definition itself.
 
 ## Service states
 
-`walden status` reports the service separately from the block. State names and
-example output are in the [README](../README.md#starting-stopping-and-status);
+`walden status` reports block state; `walden status --verbose` also reports
+the service separately from the block. State names are in the
+[README](../README.md#starting-stopping-and-status);
 edge cases and troubleshooting are in [usage.md](usage.md).
 
 ## Starting a block

@@ -464,7 +464,7 @@ fn help_lists_the_documented_commands() {
     ] {
         assert!(stdout.contains(command), "{stdout}");
     }
-    assert!(stdout.contains("Blocks distracting websites"));
+    assert!(stdout.contains(env!("CARGO_PKG_DESCRIPTION")), "{stdout}");
 }
 
 #[test]
@@ -495,4 +495,5 @@ fn help_explains_monitoring_and_waiting_without_starting_a_daemon() {
     let status_help = String::from_utf8_lossy(&status.stdout);
     assert!(!status_help.contains("--watch"));
     assert!(status_help.contains("--verbose"));
+    assert!(status_help.contains("Include daemon status"));
 }

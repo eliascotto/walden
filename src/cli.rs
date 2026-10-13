@@ -78,7 +78,7 @@ enum CommandSet {
         /// Internal diagnostics: show changes every second until Ctrl+C
         #[arg(long, hide = true)]
         watch: bool,
-        /// Include operation, timing, DNS, and daemon log details
+        /// Include daemon status, operation, timing, DNS, and daemon log details
         #[arg(long)]
         verbose: bool,
     },
@@ -368,15 +368,10 @@ fn monitor_status(
 }
 
 fn render_status(inspection: &service::ServiceInspection, verbose: bool) -> String {
-    // Reported separately from the block, because a machine without Walden
-    // installed and one sitting idle with it installed are both unblocked, and
-    // only one of them is something the user has to act on.
-    let daemon = if !verbose && matches!(inspection.state, service::ServiceState::Unhealthy(_)) {
-        "unhealthy".into()
-    } else {
-        inspection.state.describe()
-    };
-    let mut lines = vec![format_field("Daemon", &daemon)];
+    let mut lines = Vec::new();
+    if verbose {
+        lines.push(format_field("Daemon", &inspection.state.describe()));
+    }
 
     if !inspection.state.is_running() {
         let block = match &inspection.state {
@@ -1361,6 +1356,44 @@ mod tests {
     }
 
     #[test]
+    fn daemon_status_is_verbose_only_without_hiding_block_availability() {
+        use service::ServiceState;
+        for (state, status, block) in [
+            (ServiceState::NotInstalled, None, "not active"),
+            (ServiceState::Inactive, None, "not active"),
+            (
+                ServiceState::Starting,
+                None,
+                "unavailable (daemon has not answered yet)",
+            ),
+            (
+                ServiceState::Unhealthy("missing service definition".into()),
+                None,
+                "unavailable (daemon service is unhealthy)",
+            ),
+            (
+                ServiceState::Running,
+                Some(protocol::StatusResponse::inactive()),
+                "not active",
+            ),
+            (
+                ServiceState::Running,
+                None,
+                "unavailable (daemon returned no status)",
+            ),
+        ] {
+            let inspection = service::ServiceInspection { state, status };
+            assert_eq!(render_status(&inspection, false), format!("Block: {block}"));
+            let verbose = render_status(&inspection, true);
+            assert!(verbose.starts_with(&format!(
+                "Daemon: {}\nBlock: {block}\n",
+                inspection.state.describe()
+            )));
+            assert!(verbose.contains("Daemon logs: "));
+        }
+    }
+
+    #[test]
     fn status_describes_an_in_progress_apply() {
         let lines = describe_block(&applying_status(), true);
         assert!(lines.contains(&("Block", "applying — resolving hostnames 27%".into())));
@@ -1393,7 +1426,7 @@ mod tests {
             };
             assert_eq!(
                 render_status(&inspection, false),
-                format!("Daemon: running\nBlock: applying — {summary}")
+                format!("Block: applying — {summary}")
             );
         }
     }
@@ -1452,6 +1485,18 @@ mod tests {
                 ("Unblock delay", "1 minute".to_string()),
             ]
         );
+        let inspection = service::ServiceInspection {
+            state: service::ServiceState::Running,
+            status: Some(status),
+        };
+        assert_eq!(
+            render_status(&inspection, false),
+            "Block: active\nUnblock delay: 1 minute"
+        );
+        assert!(
+            render_status(&inspection, true)
+                .starts_with("Daemon: running\nBlock: active\nUnblock delay: 1 minute\n")
+        );
     }
 
     #[test]
@@ -1506,6 +1551,7 @@ mod tests {
         assert_eq!(pauses, 1);
         assert!(output[0].contains("Block: applying"));
         assert!(output.last().unwrap().contains("Block: active"));
+        assert!(output.iter().all(|snapshot| !snapshot.contains("Daemon:")));
     }
 
     #[test]
@@ -1595,6 +1641,7 @@ mod tests {
         assert_eq!(output.len(), 2);
         assert!(output[0].contains("Block: cleaning up"));
         assert!(output[1].contains("Block: not active"));
+        assert!(output.iter().all(|snapshot| !snapshot.contains("Daemon:")));
     }
 
     #[test]
@@ -1670,7 +1717,7 @@ mod tests {
         let normal = render_status(&inspection, false);
         assert_eq!(
             normal,
-            "Daemon: running\nBlock: start failed (firewall setup)\nDetails: walden status --verbose"
+            "Block: start failed (firewall setup)\nDetails: walden status --verbose"
         );
         let verbose = render_status(&inspection, true);
         assert!(verbose.contains("native PF parser error"));

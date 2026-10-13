@@ -2,7 +2,7 @@
 
 A destkop CLI tool to hard block websites that are known to be harmful or addictive. Created to help users be more productive and prevent brain rot. Works on MacOS and Linux.
 
-![Made with VHS](https://vhs.charm.sh/vhs-18HDdXQWhlf2ed4xRlSi9M.gif)
+![Made with VHS](https://vhs.charm.sh/vhs-1xXbU9kzsn3q3gDVYK7mex.gif)
 
 The term “brain rot” first appeared in English in *Walden*, by [Henry David Thoreau](https://en.wikipedia.org/wiki/Henry_David_Thoreau).
 
@@ -46,8 +46,8 @@ Sites remain blocked for the unlock delay you chose during setup. Once the block
 | --- | --- |
 | `walden setup` | Create or update the config (wizard or flags) |
 | `walden start` | Start a block; delay locks in once rules are applied |
-| `walden status` | Daemon + block state |
-| `walden status --verbose` | Show progress, failures, retries, and diagnostic details |
+| `walden status` | Block state, progress, and active unblock delay |
+| `walden status --verbose` | Add daemon status, counts, failures, retries, and diagnostic details |
 | `walden start --wait` | Wait until the accepted block's rules are active |
 | `walden stop` | Request end; sites stay blocked until the delay expires |
 | `walden categories` | List catalog IDs |
@@ -224,7 +224,8 @@ Until rules have been applied, `walden stop` cancels the start instead of
 locking in the unlock delay. After they are applied, the wait cannot be
 shortened or cancelled. A second `walden stop` cannot shorten it either.
 
-`walden status` reports the service and the block separately:
+`walden status` reports block state, progress, and the active unblock delay.
+`walden status --verbose` also reports the daemon service separately:
 
 | Daemon | Meaning |
 | --- | --- |
@@ -246,9 +247,9 @@ next automatic retry. New blocks remain unavailable until cleanup finishes.
 An invalid saved state is shown as `unavailable` with a locked-daemon explanation,
 instead of being presented as an active or inactive block.
 
-Use `walden status --verbose` for the operation ID, apply timing, DNS details,
-and the command to read daemon logs. macOS diagnostics go to the system log;
-Linux diagnostics go to the service journal.
+Use `walden status --verbose` for daemon status, the operation ID, apply timing,
+DNS details, and the command to read daemon logs. macOS diagnostics go to the
+system log; Linux diagnostics go to the service journal.
 
 Initial firewall validation happens before DNS resolution. Transient failures
 retry with backoff and reuse fresh DNS results. A persistent firewall validation

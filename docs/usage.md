@@ -24,7 +24,6 @@ Applying rules for 44971 websites. This can take a few minutes.
 Use `walden status` to follow progress and confirm when enforcement is active:
 
 ```text
-Daemon: running
 Block: applying — resolving hostnames 27%
 ```
 
@@ -33,7 +32,7 @@ Normal status shows the current stage: `writing hosts`, `preparing firewall rule
 The percentage during resolution measures hostnames checked, including failed
 lookups. Reaching 100% means DNS checks are complete; wait for `Block: active`
 to confirm the rules are installed. Address counts, unresolved hostname counts,
-and failure diagnostics are available with `walden status --verbose`.
+daemon status, and failure diagnostics are available with `walden status --verbose`.
 
 Resolution remains bounded to 64 workers even for
 the largest catalog. Walden resolves eagerly because the firewall layer blocks
@@ -61,27 +60,40 @@ If no block is active, it says there is nothing to stop. These are daemon
 outcomes from the stop request itself; the CLI does not issue a status request
 first and guess which case occurred.
 
-Example status output:
+Example `walden status` output:
 
 ```text
-Daemon: running
 Block: active
 Unblock delay: 3 days
 ```
 
 ```text
-Daemon: running
 Block: ending in 2d 4h
-Ends at: 18:00:00 2026/08/26
 ```
 
 ```text
-Daemon: installed but not running
 Block: not active
 ```
 
+`walden status --verbose` adds daemon status and diagnostics. For an active
+block on macOS, example output is:
+
+```text
+Daemon: running
+Block: active
+Unblock delay: 3 days
+Websites: 44971
+Operation: operation-1
+Daemon logs: log show --last 1h --predicate 'process == "waldend"'
+```
+
+On Linux, the `Daemon logs` command is
+`journalctl -u waldend.service --since '1 hour ago'`. During the unblock
+countdown, verbose output also includes `Ends at:`, for example
+`Ends at: 18:00:00 2026/08/26`.
+
 Daemon state meanings are in the [README](../README.md#starting-stopping-and-status).
-Two cases worth calling out:
+Two cases worth calling out in verbose status:
 
 - A service definition whose executable is missing, or the reverse, reads as
   `unhealthy`, not `not installed`.
@@ -140,7 +152,8 @@ If a start is refused because previous cleanup is pending, no new block has
 been started. Status reports `cleaning up` or `cleanup failed`; verbose status
 includes the failing step and the next automatic retry. A running daemon alone does not mean
 it is ready to accept another block. After cleanup completes, the daemon exits;
-status returns to `installed but not running` / `not active`.
+normal status returns to `Block: not active`; verbose status also shows
+`Daemon: installed but not running`.
 
 A firewall setup error can fail a pending start even when DNS resolution succeeds.
 Verbose status separates the last failure's stage from current retry progress;
@@ -237,7 +250,7 @@ the Walden daemon service is not usable: ... reinstall the Walden package for th
 
 A service definition whose executable is missing, or an executable whose
 service definition is missing, is unhealthy rather than uninstalled.
-Reinstalling the package is the fix. `walden status` names the half that is
+Reinstalling the package is the fix. `walden status --verbose` names the half that is
 missing.
 
 ### Linux is missing nftables or systemd
@@ -268,8 +281,8 @@ the Walden daemon is running but is not answering on /var/run/waldend.sock; chec
 
 The service is active and the socket is not. That is a different problem from
 a daemon that never started. Check the service-manager log for `waldend`.
-`walden status` reads this as `starting` until the wait for the socket runs
-out.
+`walden status --verbose` reports the daemon as `starting` while it remains
+unreachable. Normal status reports the block as `unavailable`.
 
 ### The configuration is rejected
 
