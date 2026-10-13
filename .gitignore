@@ -5,3 +5,5 @@
 # are published by walden-list, not kept here; assets/catalog.lock is the only
 # record of them this repository carries.
 /vendor
+
+*.gif
