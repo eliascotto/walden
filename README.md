@@ -1,6 +1,6 @@
 # Walden
 
-A destkop CLI tool to hard block websites that are known to be harmful or addictive. Created to help users be more productive and prevent brain rot. Works on MacOS and Linux.
+A CLI tool to hard block websites that are known to be harmful or addictive. Created to help users be more productive and prevent brain rot. Works on MacOS and Linux.
 
 ![Made with VHS](https://vhs.charm.sh/vhs-1xXbU9kzsn3q3gDVYK7mex.gif)
 
